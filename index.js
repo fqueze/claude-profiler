@@ -710,4 +710,8 @@ async function main() {
   }
 }
 
-main();
+module.exports = { readJsonlFile, createFirefoxProfile };
+
+if (require.main === module) {
+  main();
+}

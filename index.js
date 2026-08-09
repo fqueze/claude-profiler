@@ -6,94 +6,59 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-// Pricing per million tokens (updated January 2025)
-// Source: https://docs.anthropic.com/en/docs/about-claude/pricing
-// Cache pricing: write = 1.25x input, read = 0.1x input
-const PRICING = {
-  // Claude 3 Haiku
-  'claude-3-haiku': {
-    input: 0.25,
-    output: 1.25,
-    cacheWrite: 0.30,  // 0.25 * 1.25
-    cacheRead: 0.03    // 0.25 * 0.1
-  },
-  // Claude 3.5 Haiku
-  'claude-3-5-haiku': {
-    input: 0.80,
-    output: 4.00,
-    cacheWrite: 1.00,  // 0.80 * 1.25
-    cacheRead: 0.08    // 0.80 * 0.1
-  },
-  // Claude 4.5 Haiku
-  'claude-haiku-4-5': {
-    input: 1.00,
-    output: 5.00,
-    cacheWrite: 1.25,  // 1.00 * 1.25
-    cacheRead: 0.10    // 1.00 * 0.1
-  },
-  // Claude 3.5 Sonnet
-  'claude-3-5-sonnet': {
-    input: 3.00,
-    output: 15.00,
-    cacheWrite: 3.75,  // 3.00 * 1.25
-    cacheRead: 0.30    // 3.00 * 0.1
-  },
-  // Claude 4.5 Sonnet
-  'claude-sonnet-4-5': {
-    input: 3.00,
-    output: 15.00,
-    cacheWrite: 3.75,  // 3.00 * 1.25
-    cacheRead: 0.30    // 3.00 * 0.1
-  },
-  // Claude 4.1 Sonnet
-  'claude-4-1-sonnet': {
-    input: 5.00,
-    output: 25.00,
-    cacheWrite: 6.25,  // 5.00 * 1.25
-    cacheRead: 0.50    // 5.00 * 0.1
-  },
-  // Claude Opus 4
-  'claude-opus-4': {
-    input: 15.00,
-    output: 75.00,
-    cacheWrite: 18.75,  // 15.00 * 1.25
-    cacheRead: 1.50     // 15.00 * 0.1
-  },
-  // Default pricing (use 3.5 Sonnet as default)
-  'default': {
-    input: 3.00,
-    output: 15.00,
-    cacheWrite: 3.75,
-    cacheRead: 0.30
-  }
-};
+// Prices per million tokens, from
+// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-08-09).
+// Matched in order, so the models that don't follow their family's price come
+// first. Cache prices are derived from the input price rather than listed
+// separately: a 5 minute cache write costs 1.25x, a 1 hour write 2x, and a read
+// 0.1x.
+const PRICING = [
+  // Claude Fable 5 and Claude Mythos 5
+  { match: /fable|mythos/, input: 10.00, output: 50.00 },
+  // Claude Opus 4.1 and older, before the Opus price cut
+  { match: /opus-4-[01]|opus-4-2025|3-opus/, input: 15.00, output: 75.00 },
+  // Claude Opus 5, 4.8, 4.7, 4.6 and 4.5
+  { match: /opus/, input: 5.00, output: 25.00 },
+  // Every Sonnet. Claude Sonnet 5 is $2/$10 until 2026-08-31 under introductory
+  // pricing, which is not applied here.
+  { match: /sonnet/, input: 3.00, output: 15.00 },
+  { match: /haiku-4-5|haiku-4\.5/, input: 1.00, output: 5.00 },
+  { match: /3-5-haiku|haiku.*3\.5/, input: 0.80, output: 4.00 },
+  { match: /3-haiku|haiku/, input: 0.25, output: 1.25 }
+];
+
+// Sonnet, as the middle of the range, when the model is unknown.
+const DEFAULT_PRICING = { input: 3.00, output: 15.00 };
+
+const CACHE_WRITE_5M_MULTIPLIER = 1.25;
+const CACHE_WRITE_1H_MULTIPLIER = 2;
+const CACHE_READ_MULTIPLIER = 0.1;
 
 function getPricingForModel(modelId) {
-  if (!modelId) return PRICING.default;
+  if (!modelId) {
+    return DEFAULT_PRICING;
+  }
 
   const model = modelId.toLowerCase();
-
-  // Match specific model versions
-  if (model.includes('opus') && model.includes('4')) return PRICING['claude-opus-4'];
-  if (model.includes('sonnet-4-5') || model.includes('sonnet-4.5')) return PRICING['claude-sonnet-4-5'];
-  if (model.includes('haiku-4-5') || model.includes('haiku-4.5')) return PRICING['claude-haiku-4-5'];
-  if (model.includes('sonnet') && model.includes('3.5')) return PRICING['claude-3-5-sonnet'];
-  if (model.includes('haiku') && model.includes('3.5')) return PRICING['claude-3-5-haiku'];
-  if (model.includes('haiku') && model.includes('3-haiku')) return PRICING['claude-3-haiku'];
-
-  // Fallback for generic model names
-  if (model.includes('opus')) return PRICING['claude-opus-4'];
-  if (model.includes('sonnet')) return PRICING['claude-sonnet-4-5'];
-  if (model.includes('haiku')) return PRICING['claude-haiku-4-5'];
-
-  return PRICING.default;
+  return PRICING.find(pricing => pricing.match.test(model)) || DEFAULT_PRICING;
 }
 
 function calculateCost(usage, pricing) {
+  // The two cache lifetimes are billed differently. Logs that predate the
+  // split only have the total, which was a 5 minute write.
+  const creation = usage.cache_creation;
+  const cacheWrite1h = creation?.ephemeral_1h_input_tokens || 0;
+  const cacheWrite5m = creation
+    ? creation.ephemeral_5m_input_tokens || 0
+    : usage.cache_creation_input_tokens || 0;
+
   const inputCost = (usage.input_tokens || 0) * pricing.input / 1000000;
   const outputCost = (usage.output_tokens || 0) * pricing.output / 1000000;
-  const cacheWriteCost = (usage.cache_creation_input_tokens || 0) * pricing.cacheWrite / 1000000;
-  const cacheReadCost = (usage.cache_read_input_tokens || 0) * pricing.cacheRead / 1000000;
+  const cacheWriteCost =
+    (cacheWrite5m * CACHE_WRITE_5M_MULTIPLIER + cacheWrite1h * CACHE_WRITE_1H_MULTIPLIER) *
+    pricing.input / 1000000;
+  const cacheReadCost =
+    (usage.cache_read_input_tokens || 0) * CACHE_READ_MULTIPLIER * pricing.input / 1000000;
 
   return {
     input: inputCost,

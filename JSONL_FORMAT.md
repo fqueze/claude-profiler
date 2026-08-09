@@ -252,32 +252,51 @@ time. Use the first and last timestamps of the agent's own transcript instead.
 
 To calculate API costs from usage data:
 
-### Anthropic Pricing (per million tokens, as of January 2025)
+### Anthropic Pricing (per million tokens, checked 2026-08-09)
 
-| Model | Input | Output | Cache Write | Cache Read |
-|-------|--------|--------|-------------|------------|
-| claude-3-haiku | $0.25 | $1.25 | $0.30 | $0.03 |
-| claude-3-5-haiku | $0.80 | $4.00 | $1.00 | $0.08 |
-| claude-haiku-4-5 | $1.00 | $5.00 | $1.25 | $0.10 |
-| claude-3-5-sonnet | $3.00 | $15.00 | $3.75 | $0.30 |
-| claude-sonnet-4-5 | $3.00 | $15.00 | $3.75 | $0.30 |
-| claude-4-1-sonnet | $5.00 | $25.00 | $6.25 | $0.50 |
-| claude-opus-4 | $15.00 | $75.00 | $18.75 | $1.50 |
+| Model | Input | Output |
+|-------|--------|--------|
+| claude-fable-5, claude-mythos-5 | $10.00 | $50.00 |
+| claude-opus-5 | $5.00 | $25.00 |
+| claude-opus-4-8, -4-7, -4-6, -4-5 | $5.00 | $25.00 |
+| claude-opus-4-1, claude-opus-4, claude-3-opus | $15.00 | $75.00 |
+| claude-sonnet-5 | $3.00 | $15.00 |
+| claude-sonnet-4-6, -4-5, claude-3-5-sonnet | $3.00 | $15.00 |
+| claude-haiku-4-5 | $1.00 | $5.00 |
+| claude-3-5-haiku | $0.80 | $4.00 |
+| claude-3-haiku | $0.25 | $1.25 |
 
-**Cache Write Pricing**: Cache creation tokens are billed at 1.25× the input token price.
+Source: <https://platform.claude.com/docs/en/about-claude/pricing>. Claude
+Sonnet 5 has introductory pricing of $2.00 / $10.00 through 2026-08-31.
 
-**Cache Read Pricing**: Cache read tokens are billed at 0.1× the input token price.
+**Cache pricing** is a multiple of the model's input price, so it doesn't need
+its own column:
+
+| Token type | Multiplier |
+|------------|-----------|
+| 5-minute cache write (`cache_creation.ephemeral_5m_input_tokens`) | 1.25× input |
+| 1-hour cache write (`cache_creation.ephemeral_1h_input_tokens`) | 2× input |
+| Cache read (`cache_read_input_tokens`) | 0.1× input |
+
+The two cache lifetimes are billed differently, so use the `cache_creation`
+breakdown rather than the flat `cache_creation_input_tokens` where it exists.
 
 ### Cost Formula
 
 ```javascript
 function calculateCost(usage, pricing) {
-  const inputCost = (usage.input_tokens || 0) * pricing.input / 1_000_000;
-  const outputCost = (usage.output_tokens || 0) * pricing.output / 1_000_000;
-  const cacheWriteCost = (usage.cache_creation_input_tokens || 0) * pricing.cacheWrite / 1_000_000;
-  const cacheReadCost = (usage.cache_read_input_tokens || 0) * pricing.cacheRead / 1_000_000;
+  const creation = usage.cache_creation;
+  const cacheWrite1h = creation?.ephemeral_1h_input_tokens || 0;
+  const cacheWrite5m = creation
+    ? creation.ephemeral_5m_input_tokens || 0
+    : usage.cache_creation_input_tokens || 0;
 
-  return inputCost + outputCost + cacheWriteCost + cacheReadCost;
+  return (
+    (usage.input_tokens || 0) * pricing.input +
+    (usage.output_tokens || 0) * pricing.output +
+    (cacheWrite5m * 1.25 + cacheWrite1h * 2) * pricing.input +
+    (usage.cache_read_input_tokens || 0) * 0.1 * pricing.input
+  ) / 1_000_000;
 }
 ```
 

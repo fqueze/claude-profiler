@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -106,28 +107,284 @@ function calculateCost(usage, pricing) {
 function readJsonlFile(filePath) {
   const content = fs.readFileSync(filePath, 'utf-8');
   const lines = content.trim().split('\n');
-  return lines.map(line => JSON.parse(line));
+  return lines.filter(line => line.length > 0).map(line => JSON.parse(line));
 }
 
-function createFirefoxProfile(jsonlData) {
-  // Filter out summary entries and get messages
-  const messages = jsonlData.filter(entry =>
-    entry.type === 'user' || entry.type === 'assistant'
+// Sub-agent transcripts live next to the main session file, in
+// <session-id>/subagents/agent-<id>.jsonl, each with an agent-<id>.meta.json
+// describing the agent type, the task description and the spawn depth.
+function readSubagents(sessionFilePath) {
+  return readSubagentsDir(path.join(
+    path.dirname(sessionFilePath),
+    path.basename(sessionFilePath, '.jsonl'),
+    'subagents'
+  ));
+}
+
+// Same, for callers that only have the session id: sessions of every project
+// live side by side under ~/.claude/projects/<project>/.
+function readSubagentsForSession(sessionId) {
+  const projects = path.join(
+    process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'),
+    'projects'
   );
 
-  if (messages.length === 0) {
-    throw new Error('No messages found in the jsonl file');
+  if (!sessionId || !fs.existsSync(projects)) {
+    return [];
   }
 
-  // Get time range
-  const timestamps = messages
-    .map(msg => new Date(msg.timestamp).getTime())
-    .sort((a, b) => a - b);
+  for (const project of fs.readdirSync(projects)) {
+    const dir = path.join(projects, project, sessionId, 'subagents');
+    if (fs.existsSync(dir)) {
+      return readSubagentsDir(dir);
+    }
+  }
 
-  const startTime = timestamps[0];
-  const endTime = timestamps[timestamps.length - 1];
+  return [];
+}
 
-  // Create string table (for storing strings efficiently)
+function readSubagentsDir(dir) {
+  if (!fs.existsSync(dir)) {
+    return [];
+  }
+
+  const agents = [];
+  for (const file of fs.readdirSync(dir).sort()) {
+    if (!file.startsWith('agent-') || !file.endsWith('.jsonl')) {
+      continue;
+    }
+
+    const id = file.slice('agent-'.length, -'.jsonl'.length);
+    const metaPath = path.join(dir, `agent-${id}.meta.json`);
+    const meta = fs.existsSync(metaPath)
+      ? JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
+      : {};
+
+    agents.push({ id, meta, entries: readJsonlFile(path.join(dir, file)) });
+  }
+
+  return agents;
+}
+
+function conversationEntries(jsonlData) {
+  return jsonlData.filter(entry =>
+    entry.type === 'user' || entry.type === 'assistant'
+  );
+}
+
+function entryText(entry) {
+  const content = entry.message?.content || '';
+  return typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map(c => c.text || '').join(' ').trim()
+      : '';
+}
+
+// Claude Code names the session itself, in an `ai-title` entry rewritten as the
+// conversation goes on (older sessions have a `summary` entry instead). That
+// title is what the session is called in the UI, so it makes a better track
+// name than anything we could come up with; fall back to the opening prompt.
+function sessionTitle(jsonlData) {
+  for (let i = jsonlData.length - 1; i >= 0; i--) {
+    const entry = jsonlData[i];
+    if (entry.type === 'ai-title' && entry.aiTitle) {
+      return entry.aiTitle;
+    }
+    if (entry.type === 'summary' && entry.summary) {
+      return entry.summary;
+    }
+  }
+
+  const firstPrompt = jsonlData.find(entry =>
+    entry.type === 'user' && entry.message?.role === 'user' && entryText(entry)
+  );
+
+  if (firstPrompt) {
+    const text = entryText(firstPrompt).replace(/\s+/g, ' ');
+    return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+  }
+
+  return 'Main conversation';
+}
+
+// One requestId = one API call, but several entries can share it.
+function uniqueApiCalls(messages) {
+  const seenRequestIds = new Set();
+  return messages.filter(msg => {
+    if (!msg.message?.usage || !msg.requestId || seenRequestIds.has(msg.requestId)) {
+      return false;
+    }
+    seenRequestIds.add(msg.requestId);
+    return true;
+  });
+}
+
+function totalCost(messages) {
+  return uniqueApiCalls(messages).reduce((sum, msg) => {
+    const pricing = getPricingForModel(msg.message.model);
+    return sum + calculateCost(msg.message.usage, pricing).total;
+  }, 0);
+}
+
+// Groups the assistant entries of one API response together. The response runs
+// from the last thing the model was handed to the last chunk it produced, which
+// covers queueing, inference and streaming — the time nothing else explains.
+function findModelResponses(messages) {
+  const responses = [];
+
+  messages.forEach((msg, index) => {
+    if (msg.type !== 'assistant' || !msg.requestId) {
+      return;
+    }
+
+    const time = new Date(msg.timestamp).getTime();
+    const current = responses[responses.length - 1];
+
+    if (current && current.requestId === msg.requestId) {
+      current.end = time;
+    } else {
+      const previous = messages[index - 1];
+      responses.push({
+        requestId: msg.requestId,
+        start: previous ? new Date(previous.timestamp).getTime() : time,
+        end: time,
+        message: msg.message,
+        effort: msg.effort
+      });
+    }
+
+    if (msg.message?.stop_reason) {
+      responses[responses.length - 1].stopReason = msg.message.stop_reason;
+    }
+  });
+
+  return responses;
+}
+
+// Pairs every tool_use block with the tool_result that answers it, giving the
+// duration of the call. A call still running when the log ends stays unpaired.
+function findToolCalls(messages) {
+  const pending = new Map();
+  const calls = [];
+
+  messages.forEach((msg) => {
+    const content = msg.message?.content;
+    if (!Array.isArray(content)) return;
+
+    const time = new Date(msg.timestamp).getTime();
+    content.forEach((block) => {
+      if (block.type === 'tool_use') {
+        const call = {
+          name: block.name,
+          input: block.input,
+          start: time,
+          end: null
+        };
+        pending.set(block.id, call);
+        calls.push(call);
+      } else if (block.type === 'tool_result') {
+        const call = pending.get(block.tool_use_id);
+        if (call) {
+          pending.delete(block.tool_use_id);
+          call.end = time;
+          call.isError = block.is_error === true;
+          call.result = msg.toolUseResult;
+        }
+      }
+    });
+  });
+
+  return calls;
+}
+
+// The part of a tool call worth reading at a glance: what it ran, or on what.
+function toolCallDetail(name, input) {
+  if (!input) {
+    return '';
+  }
+
+  switch (name) {
+    case 'Bash':
+      return input.command;
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+    case 'NotebookEdit':
+      return input.file_path;
+    case 'Grep':
+    case 'Glob':
+      return [input.pattern, input.path].filter(Boolean).join(' in ');
+    case 'WebFetch':
+      return input.url;
+    case 'WebSearch':
+      return input.query;
+    case 'Skill':
+      return input.skill;
+    case 'Task':
+    case 'Agent':
+      return input.description;
+    default:
+      return input.description || JSON.stringify(input);
+  }
+}
+
+// How much the call sent back, which is what it cost the context.
+function toolResultSize(result) {
+  if (typeof result === 'string') {
+    return result.length;
+  }
+
+  if (!result || typeof result !== 'object') {
+    return 0;
+  }
+
+  if (typeof result.stdout === 'string' || typeof result.stderr === 'string') {
+    return (result.stdout || '').length + (result.stderr || '').length;
+  }
+
+  if (typeof result.content === 'string') {
+    return result.content.length;
+  }
+
+  if (typeof result.file?.content === 'string') {
+    return result.file.content.length;
+  }
+
+  return JSON.stringify(result).length;
+}
+
+// Ids of the Task/Agent tool calls made from a set of entries. A sub-agent's
+// meta.json points back at one of these, which is how nested agents can be
+// attributed to the agent that spawned them rather than to the main session.
+function findAgentToolUses(messages) {
+  const toolUses = new Set();
+  messages.forEach(msg => {
+    const content = msg.message?.content;
+    if (!Array.isArray(content)) return;
+    content.forEach(block => {
+      if (block.type === 'tool_use' && (block.name === 'Task' || block.name === 'Agent')) {
+        toolUses.add(block.id);
+      }
+    });
+  });
+  return toolUses;
+}
+
+function buildThread({
+  entries,
+  messages,
+  apiCalls,
+  totalCostPoints,
+  startTime,
+  threadName,
+  processName,
+  pid,
+  tid,
+  spans,
+  registerTime,
+  unregisterTime
+}) {
   const stringTable = new Map();
   const strings = [];
 
@@ -139,36 +396,8 @@ function createFirefoxProfile(jsonlData) {
     return stringTable.get(str);
   }
 
-  // Pre-populate root string
   const rootStrIdx = addString('(root)');
 
-  // Process messages and extract text content
-  const messagesWithText = [];
-
-  messages.forEach((msg) => {
-    const role = msg.message?.role || msg.type;
-    const content = msg.message?.content || '';
-    const contentText = typeof content === 'string'
-      ? content
-      : Array.isArray(content)
-        ? content.map(c => c.text || '').join(' ').trim()
-        : '';
-
-    // Only include messages with actual text content
-    if (contentText && contentText.length > 0) {
-      messagesWithText.push({
-        ...msg,
-        role,
-        contentText
-      });
-    }
-  });
-
-  if (messagesWithText.length === 0) {
-    throw new Error('No messages with text content found in the jsonl file');
-  }
-
-  // Create markers for each message with text (correct format)
   const markers = {
     data: [],
     name: [],
@@ -179,190 +408,213 @@ function createFirefoxProfile(jsonlData) {
     length: 0
   };
 
-  messagesWithText.forEach((msg) => {
-    const timestamp = new Date(msg.timestamp).getTime();
-    const relativeTime = timestamp - startTime;
+  function addMarker(nameIdx, start, end, phase, category, data) {
+    markers.name.push(nameIdx);
+    markers.startTime.push(start);
+    markers.endTime.push(end);
+    markers.phase.push(phase);
+    markers.category.push(category);
+    markers.data.push(data);
+    markers.length++;
+  }
 
-    markers.name.push(addString(msg.role));
-    markers.startTime.push(relativeTime);
-    markers.endTime.push(relativeTime);
-    markers.phase.push(0);  // 0 = instant marker
-    markers.category.push(0);
-    markers.data.push({
+  // Process messages and extract text content
+  const messagesWithText = [];
+
+  messages.forEach((msg) => {
+    const contentText = entryText(msg);
+
+    // Only include messages with actual text content
+    if (contentText.length > 0) {
+      messagesWithText.push({
+        ...msg,
+        role: msg.message?.role || msg.type,
+        contentText
+      });
+    }
+  });
+
+  messagesWithText.forEach((msg) => {
+    const relativeTime = new Date(msg.timestamp).getTime() - startTime;
+    addMarker(addString(msg.role), relativeTime, relativeTime, 0, 0, {
       type: 'Text',
       text: msg.contentText
     });
-    markers.length++;
   });
 
-  // Add separate token usage markers for messages with usage data
+  // What the model itself was doing, as opposed to the tools it called. The
+  // reasoning behind it is not recoverable: thinking blocks keep their
+  // signature but the text is not written to the log.
+  findModelResponses(messages).forEach((response) => {
+    const usage = response.message?.usage || {};
+    addMarker(
+      addString(response.message?.model || 'model'),
+      response.start - startTime,
+      response.end - startTime,
+      1,
+      5,
+      {
+        type: 'ModelResponse',
+        model: response.message?.model || 'unknown',
+        effort: response.effort,
+        speed: usage.speed,
+        stopReason: response.stopReason,
+        outputTokens: usage.output_tokens || 0,
+        iterations: Array.isArray(usage.iterations) ? usage.iterations.length : 1
+      }
+    );
+  });
+
+  // Claude Code measures each turn itself and logs the result; no need to infer
+  // it. Sub-agent transcripts have no such entries.
+  const turnNameIdx = addString('Turn');
+  entries.forEach((entry) => {
+    if (entry.subtype !== 'turn_duration' || !entry.durationMs) return;
+
+    const end = new Date(entry.timestamp).getTime() - startTime;
+    addMarker(turnNameIdx, end - entry.durationMs, end, 1, 1, {
+      type: 'Turn',
+      messages: entry.messageCount || 0,
+      backgroundAgents: entry.pendingBackgroundAgentCount || 0
+    });
+  });
+
+  // Points where the user stepped in: a denied tool call, or feedback attached
+  // to a tool result.
+  const interventionNameIdx = addString('User intervention');
+  entries.forEach((entry) => {
+    if (!entry.toolDenialKind && !entry.userFeedback) return;
+
+    const relativeTime = new Date(entry.timestamp).getTime() - startTime;
+    addMarker(interventionNameIdx, relativeTime, relativeTime, 0, 4, {
+      type: 'Intervention',
+      kind: entry.toolDenialKind || 'feedback',
+      text: entryText(entry).slice(0, 500)
+    });
+  });
+
+  // Tool calls, as intervals running from the request to the result. Each is
+  // named after the tool, so the marker chart gets one row per tool.
+  const MAX_DETAIL = 200;
+  findToolCalls(messages).forEach((call) => {
+    const detail = toolCallDetail(call.name, call.input) || '';
+    const interrupted = call.result?.interrupted === true;
+
+    addMarker(
+      addString(call.name),
+      call.start - startTime,
+      // A call with no result was still running when the log ended.
+      (call.end === null ? unregisterTime + startTime : call.end) - startTime,
+      1,
+      call.isError || interrupted ? 4 : 3,
+      {
+        type: 'ToolCall',
+        name: call.name,
+        detail: detail.length > MAX_DETAIL ? `${detail.slice(0, MAX_DETAIL)}…` : detail,
+        outputBytes: toolResultSize(call.result),
+        status: call.end === null ? 'running at end of log'
+          : interrupted ? 'interrupted'
+          : call.isError ? 'error'
+          : 'ok'
+      }
+    );
+  });
+
+  // Sub-agents spawned from this thread, as interval markers covering the
+  // lifetime of the sub-agent's own track.
+  const subagentNameIdx = addString('Subagent');
+  spans.forEach((span) => {
+    addMarker(subagentNameIdx, span.start - startTime, span.end - startTime, 1, 2, {
+      type: 'Subagent',
+      description: span.description,
+      agentType: span.agentType,
+      agentId: span.agentId,
+      cost: span.cost
+    });
+  });
+
+  // Separate token usage markers for each unique API call
   const outputTokensNameIdx = addString('Output Tokens');
   const inputTokensNameIdx = addString('Input Tokens');
   const cacheReadTokensNameIdx = addString('Cache Read Tokens');
   const cacheCreationTokensNameIdx = addString('Cache Creation Tokens');
   const costNameIdx = addString('Cost ($)');
-  const cumulativeCostNameIdx = addString('Cumulative Cost ($)');
+  const agentCostNameIdx = addString('Agent Cost ($)');
+  const contextSizeNameIdx = addString('Context Size');
 
-  let cumulativeCost = 0;
-  const seenRequestIds = new Set();
+  apiCalls.forEach(({ msg, costs, agentCost }) => {
+    const usage = msg.message.usage;
+    const relativeTime = new Date(msg.timestamp).getTime() - startTime;
 
-  // Aggregate tokens by model for accurate cost calculation
-  const tokensByModel = new Map();
+    // Everything the model was sent is the context at that point, whether it
+    // came from the cache or not. It grows as the agent works and drops back
+    // when the conversation is compacted.
+    addMarker(contextSizeNameIdx, relativeTime, relativeTime, 0, 1, {
+      type: 'ContextSize',
+      tokens: (usage.input_tokens || 0) +
+        (usage.cache_read_input_tokens || 0) +
+        (usage.cache_creation_input_tokens || 0)
+    });
 
-  messages.forEach((msg) => {
-    const usage = msg.message?.usage;
-    if (usage) {
-      // Deduplicate by requestId - one requestId = one API call
-      const requestId = msg.requestId;
-      if (!requestId || seenRequestIds.has(requestId)) {
-        return;
-      }
-      seenRequestIds.add(requestId);
-
-      const modelId = msg.message?.model || 'unknown';
-
-      if (!tokensByModel.has(modelId)) {
-        tokensByModel.set(modelId, {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0
-        });
-      }
-
-      const tokens = tokensByModel.get(modelId);
-      tokens.input += usage.input_tokens || 0;
-      tokens.output += usage.output_tokens || 0;
-      tokens.cacheRead += usage.cache_read_input_tokens || 0;
-      tokens.cacheWrite += usage.cache_creation_input_tokens || 0;
-    }
-  });
-
-  // Calculate total cost from aggregated tokens
-  for (const [modelId, tokens] of tokensByModel) {
-    const pricing = getPricingForModel(modelId);
-    const modelCost =
-      tokens.input * pricing.input / 1000000 +
-      tokens.output * pricing.output / 1000000 +
-      tokens.cacheRead * pricing.cacheRead / 1000000 +
-      tokens.cacheWrite * pricing.cacheWrite / 1000000;
-
-    cumulativeCost += modelCost;
-  }
-
-  // Now create markers for each unique API call
-  seenRequestIds.clear();
-  let runningCost = 0;
-
-  messages.forEach((msg) => {
-    const usage = msg.message?.usage;
-    if (usage) {
-      // Deduplicate by requestId
-      const requestId = msg.requestId;
-      if (!requestId || seenRequestIds.has(requestId)) {
-        return;
-      }
-      seenRequestIds.add(requestId);
-
-      const modelId = msg.message?.model || 'unknown';
-      const timestamp = new Date(msg.timestamp).getTime();
-      const relativeTime = timestamp - startTime;
-
-      // Get pricing for this model
-      const pricing = getPricingForModel(modelId);
-      const costs = calculateCost(usage, pricing);
-
-      // Update running cost for cumulative chart
-      runningCost += costs.total;
-
-      // Create separate markers for each token type
-      // Output tokens
-      if (usage.output_tokens > 0) {
-        markers.name.push(outputTokensNameIdx);
-        markers.startTime.push(relativeTime);
-        markers.endTime.push(relativeTime);
-        markers.phase.push(0);  // 0 = instant marker
-        markers.category.push(1);
-        markers.data.push({
-          type: 'OutputTokens',
-          count: usage.output_tokens
-        });
-        markers.length++;
-      }
-
-      // Input tokens
-      if (usage.input_tokens > 0) {
-        markers.name.push(inputTokensNameIdx);
-        markers.startTime.push(relativeTime);
-        markers.endTime.push(relativeTime);
-        markers.phase.push(0);
-        markers.category.push(1);
-        markers.data.push({
-          type: 'InputTokens',
-          count: usage.input_tokens
-        });
-        markers.length++;
-      }
-
-      // Cache read tokens
-      if (usage.cache_read_input_tokens > 0) {
-        markers.name.push(cacheReadTokensNameIdx);
-        markers.startTime.push(relativeTime);
-        markers.endTime.push(relativeTime);
-        markers.phase.push(0);
-        markers.category.push(1);
-        markers.data.push({
-          type: 'CacheReadTokens',
-          count: usage.cache_read_input_tokens
-        });
-        markers.length++;
-      }
-
-      // Cache creation tokens
-      if (usage.cache_creation_input_tokens > 0) {
-        markers.name.push(cacheCreationTokensNameIdx);
-        markers.startTime.push(relativeTime);
-        markers.endTime.push(relativeTime);
-        markers.phase.push(0);
-        markers.category.push(1);
-        markers.data.push({
-          type: 'CacheCreationTokens',
-          count: usage.cache_creation_input_tokens
-        });
-        markers.length++;
-      }
-
-      // Add cost marker
-      if (costs.total > 0) {
-        markers.name.push(costNameIdx);
-        markers.startTime.push(relativeTime);
-        markers.endTime.push(relativeTime);
-        markers.phase.push(0);
-        markers.category.push(1);
-        markers.data.push({
-          type: 'Cost',
-          cost: costs.total,
-          input: costs.input,
-          output: costs.output,
-          cacheWrite: costs.cacheWrite,
-          cacheRead: costs.cacheRead
-        });
-        markers.length++;
-      }
-
-      // Add cumulative cost marker
-      markers.name.push(cumulativeCostNameIdx);
-      markers.startTime.push(relativeTime);
-      markers.endTime.push(relativeTime);
-      markers.phase.push(0);
-      markers.category.push(1);
-      markers.data.push({
-        type: 'CumulativeCost',
-        total: runningCost
+    if (usage.output_tokens > 0) {
+      addMarker(outputTokensNameIdx, relativeTime, relativeTime, 0, 1, {
+        type: 'OutputTokens',
+        count: usage.output_tokens
       });
-      markers.length++;
     }
+
+    if (usage.input_tokens > 0) {
+      addMarker(inputTokensNameIdx, relativeTime, relativeTime, 0, 1, {
+        type: 'InputTokens',
+        count: usage.input_tokens
+      });
+    }
+
+    if (usage.cache_read_input_tokens > 0) {
+      addMarker(cacheReadTokensNameIdx, relativeTime, relativeTime, 0, 1, {
+        type: 'CacheReadTokens',
+        count: usage.cache_read_input_tokens
+      });
+    }
+
+    if (usage.cache_creation_input_tokens > 0) {
+      addMarker(cacheCreationTokensNameIdx, relativeTime, relativeTime, 0, 1, {
+        type: 'CacheCreationTokens',
+        count: usage.cache_creation_input_tokens
+      });
+    }
+
+    if (costs.total > 0) {
+      addMarker(costNameIdx, relativeTime, relativeTime, 0, 1, {
+        type: 'Cost',
+        cost: costs.total,
+        input: costs.input,
+        output: costs.output,
+        cacheWrite: costs.cacheWrite,
+        cacheRead: costs.cacheRead
+      });
+    }
+
+    // Running total of what this agent has spent so far.
+    addMarker(agentCostNameIdx, relativeTime, relativeTime, 0, 1, {
+      type: 'AgentCost',
+      total: agentCost
+    });
   });
+
+  // The session-wide total only goes on the parent track, but it is sampled at
+  // every API call of every agent, so the line is complete rather than a
+  // staircase between the parent's own calls.
+  if (totalCostPoints) {
+    const totalCostNameIdx = addString('Total Cost ($)');
+    totalCostPoints.forEach(({ time, total }) => {
+      const relativeTime = time - startTime;
+      addMarker(totalCostNameIdx, relativeTime, relativeTime, 0, 1, {
+        type: 'TotalCost',
+        total
+      });
+    });
+  }
 
   // Create samples (one sample per message with text)
   const samples = {
@@ -418,6 +670,167 @@ function createFirefoxProfile(jsonlData) {
     length: 0
   };
 
+  return {
+    processType: 'default',
+    processName,
+    processStartupTime: registerTime,
+    processShutdownTime: unregisterTime,
+    registerTime,
+    unregisterTime,
+    pausedRanges: [],
+    showMarkersInTimeline: true,
+    name: threadName,
+    isMainThread: true,
+    pid,
+    tid,
+    samples,
+    markers,
+    stackTable,
+    frameTable,
+    stringArray: strings,
+    funcTable,
+    resourceTable,
+    nativeSymbols: {
+      address: [],
+      functionSize: [],
+      libIndex: [],
+      name: [],
+      length: 0
+    }
+  };
+}
+
+// `subagents` comes from readSubagents(). Callers that only pass the main
+// session entries get the sub-agents looked up from the session id, so they
+// don't silently lose everything the sub-agents did; pass [] to opt out.
+function createFirefoxProfile(jsonlData, subagents) {
+  const messages = conversationEntries(jsonlData);
+
+  if (messages.length === 0) {
+    throw new Error('No messages found in the jsonl file');
+  }
+
+  if (!subagents) {
+    subagents = readSubagentsForSession(messages[0].sessionId);
+  }
+
+  // Describe every track: the main conversation plus one per sub-agent.
+  const tracks = [{
+    id: 'main',
+    entries: jsonlData,
+    messages,
+    threadName: sessionTitle(jsonlData),
+    processName: messages[0].cwd || 'Claude Conversation'
+  }];
+
+  subagents.forEach((agent) => {
+    const agentMessages = conversationEntries(agent.entries);
+    if (agentMessages.length === 0) {
+      return;
+    }
+
+    const description = agent.meta.description || agent.id;
+    const agentType = agent.meta.agentType || 'agent';
+
+    tracks.push({
+      id: agent.id,
+      entries: agent.entries,
+      messages: agentMessages,
+      threadName: description,
+      processName: `${agentType} (depth ${agent.meta.spawnDepth || 1})`,
+      agentType,
+      description,
+      toolUseId: agent.meta.toolUseId
+    });
+  });
+
+  // Time range covers every track.
+  tracks.forEach((track) => {
+    const times = track.messages.map(msg => new Date(msg.timestamp).getTime());
+    track.start = Math.min(...times);
+    track.end = Math.max(...times);
+  });
+
+  // Sub-agent tracks are laid out in the order they started, with the main
+  // conversation first. Sub-agent files are named after opaque agent ids, so
+  // without this the tracks come out in an arbitrary order.
+  tracks.sort((a, b) => {
+    if (a.id === 'main') return -1;
+    if (b.id === 'main') return 1;
+    return a.start - b.start;
+  });
+
+  const startTime = Math.min(...tracks.map(track => track.start));
+
+  // Cost of every API call, with two running totals: the one for the track the
+  // call belongs to, and the one for the session as a whole. The session total
+  // has to be accumulated in timestamp order across all tracks, since agents
+  // run concurrently.
+  tracks.forEach((track) => {
+    track.apiCalls = uniqueApiCalls(track.messages).map(msg => ({
+      msg,
+      time: new Date(msg.timestamp).getTime(),
+      costs: calculateCost(msg.message.usage, getPricingForModel(msg.message.model))
+    }));
+
+    let agentCost = 0;
+    track.apiCalls.forEach((call) => {
+      agentCost += call.costs.total;
+      call.agentCost = agentCost;
+    });
+    track.cost = agentCost;
+  });
+
+  let sessionCost = 0;
+  const totalCostPoints = tracks
+    .flatMap(track => track.apiCalls)
+    .sort((a, b) => a.time - b.time)
+    .map((call) => {
+      sessionCost += call.costs.total;
+      return { time: call.time, total: sessionCost };
+    });
+
+  // A sub-agent is listed on whichever track made the Task/Agent tool call its
+  // meta.json points at, so nested agents show up on their spawner's track.
+  tracks.forEach((track) => {
+    track.toolUses = findAgentToolUses(track.messages);
+    track.spans = [];
+  });
+
+  tracks.forEach((track) => {
+    if (!track.toolUseId) {
+      return;
+    }
+    const spawner = tracks.find(candidate => candidate.toolUses.has(track.toolUseId));
+    if (spawner) {
+      spawner.spans.push({
+        agentId: track.id,
+        agentType: track.agentType,
+        description: track.description,
+        start: track.start,
+        end: track.end,
+        cost: track.cost
+      });
+    }
+  });
+
+  const threads = tracks.map((track, index) => buildThread({
+    entries: track.entries,
+    messages: track.messages,
+    apiCalls: track.apiCalls,
+    totalCostPoints: track.id === 'main' ? totalCostPoints : null,
+    startTime,
+    threadName: track.threadName,
+    processName: track.processName,
+    // Numeric, and increasing with start time: the profiler orders process
+    // tracks by pid, and string pids would sort "10" before "2".
+    pid: index,
+    tid: index,
+    spans: track.spans,
+    registerTime: track.start - startTime,
+    unregisterTime: track.end - startTime
+  }));
+
   // Create categories
   const categories = [
     {
@@ -429,10 +842,30 @@ function createFirefoxProfile(jsonlData) {
       name: 'Messages',
       color: 'blue',
       subcategories: ['Other']
+    },
+    {
+      name: 'Subagents',
+      color: 'yellow',
+      subcategories: ['Other']
+    },
+    {
+      name: 'Tools',
+      color: 'green',
+      subcategories: ['Other']
+    },
+    {
+      name: 'Failed tools',
+      color: 'red',
+      subcategories: ['Other']
+    },
+    {
+      name: 'Model',
+      color: 'purple',
+      subcategories: ['Other']
     }
   ];
 
-  // Marker schema for Text and separate Token Usage markers
+  // Marker schema for Text, Subagent and separate Token Usage markers
   const markerSchema = [
     {
       name: 'Text',
@@ -447,6 +880,161 @@ function createFirefoxProfile(jsonlData) {
           format: 'string',
           searchable: true
         }
+      ]
+    },
+    {
+      name: 'ModelResponse',
+      tooltipLabel: '{marker.data.model}',
+      tableLabel: '{marker.data.model} ({marker.data.stopReason})',
+      chartLabel: '{marker.data.stopReason}',
+      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      data: [
+        {
+          key: 'model',
+          label: 'Model',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'effort',
+          label: 'Effort',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'speed',
+          label: 'Speed',
+          format: 'string'
+        },
+        {
+          key: 'stopReason',
+          label: 'Stop reason',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'outputTokens',
+          label: 'Output Tokens',
+          format: 'integer'
+        },
+        {
+          key: 'iterations',
+          label: 'Iterations',
+          format: 'integer'
+        }
+      ]
+    },
+    {
+      name: 'Turn',
+      tooltipLabel: '{marker.name}',
+      tableLabel: '{marker.name} ({marker.data.messages} messages)',
+      chartLabel: '{marker.name}',
+      display: ['marker-chart', 'marker-table'],
+      data: [
+        {
+          key: 'messages',
+          label: 'Messages in context',
+          format: 'integer'
+        },
+        {
+          key: 'backgroundAgents',
+          label: 'Pending background agents',
+          format: 'integer'
+        }
+      ]
+    },
+    {
+      name: 'Intervention',
+      tooltipLabel: '{marker.data.kind}',
+      tableLabel: '{marker.name}: {marker.data.kind}',
+      chartLabel: '{marker.data.kind}',
+      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      data: [
+        {
+          key: 'kind',
+          label: 'Kind',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'text',
+          label: 'Content',
+          format: 'string',
+          searchable: true
+        }
+      ]
+    },
+    {
+      name: 'ToolCall',
+      tooltipLabel: '{marker.data.name}',
+      tableLabel: '{marker.data.name} — {marker.data.detail}',
+      chartLabel: '{marker.data.detail}',
+      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      data: [
+        {
+          key: 'detail',
+          label: 'Input',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'outputBytes',
+          label: 'Output size',
+          format: 'bytes'
+        },
+        {
+          key: 'status',
+          label: 'Status',
+          format: 'string',
+          searchable: true
+        }
+      ]
+    },
+    {
+      name: 'Subagent',
+      tooltipLabel: '{marker.data.description}',
+      tableLabel: '{marker.data.agentType}: {marker.data.description}',
+      chartLabel: '{marker.data.description}',
+      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      data: [
+        {
+          key: 'description',
+          label: 'Task',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'agentType',
+          label: 'Agent type',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'agentId',
+          label: 'Agent id',
+          format: 'string',
+          searchable: true
+        },
+        {
+          key: 'cost',
+          label: 'Cost ($)',
+          format: 'decimal'
+        }
+      ]
+    },
+    {
+      name: 'ContextSize',
+      tooltipLabel: '{marker.name}',
+      display: [],
+      data: [
+        {
+          key: 'tokens',
+          label: 'Context Size',
+          format: 'integer'
+        }
+      ],
+      graphs: [
+        { key: 'tokens', color: 'teal', type: 'line' }
       ]
     },
     {
@@ -545,51 +1133,36 @@ function createFirefoxProfile(jsonlData) {
       ]
     },
     {
-      name: 'CumulativeCost',
+      name: 'AgentCost',
       tooltipLabel: '{marker.name}',
       display: [],
       data: [
         {
           key: 'total',
-          label: 'Cumulative Cost',
+          label: 'Agent Cost (cumulative)',
           format: 'decimal'
         }
       ],
       graphs: [
         { key: 'total', color: 'red', type: 'line' }
       ]
+    },
+    {
+      name: 'TotalCost',
+      tooltipLabel: '{marker.name}',
+      display: [],
+      data: [
+        {
+          key: 'total',
+          label: 'Total Cost',
+          format: 'decimal'
+        }
+      ],
+      graphs: [
+        { key: 'total', color: 'magenta', type: 'line' }
+      ]
     }
   ];
-
-  // Create the main thread
-  const thread = {
-    processType: 'default',
-    processName: 'Claude Conversation',
-    processStartupTime: 0,
-    processShutdownTime: null,
-    registerTime: 0,
-    unregisterTime: null,
-    pausedRanges: [],
-    showMarkersInTimeline: true,
-    name: '',
-    isMainThread: false,
-    pid: '0',
-    tid: 0,
-    samples,
-    markers,
-    stackTable,
-    frameTable,
-    stringArray: strings,
-    funcTable,
-    resourceTable,
-    nativeSymbols: {
-      address: [],
-      functionSize: [],
-      libIndex: [],
-      name: [],
-      length: 0
-    }
-  };
 
   // Create the profile
   const profile = {
@@ -608,7 +1181,7 @@ function createFirefoxProfile(jsonlData) {
       usesOnlyOneStackType: true
     },
     libs: [],
-    threads: [thread],
+    threads,
     counters: []
   };
 
@@ -637,7 +1210,11 @@ function startServer(profileData) {
 }
 
 async function openProfiler(serverUrl) {
-  const profilerUrl = `https://profiler.firefox.com/from-url/${encodeURIComponent(serverUrl)}`;
+  // `thread=0` makes the front end treat the track layout as coming from the
+  // URL, which skips the default ordering pass — that pass sorts process tracks
+  // by activity score and would scramble the order the threads are in.
+  const profilerUrl =
+    `https://profiler.firefox.com/from-url/${encodeURIComponent(serverUrl)}?thread=0`;
 
   // Try to open with xdg-open on Linux, open on macOS, or start on Windows
   const command = process.platform === 'darwin' ? 'open' :
@@ -676,8 +1253,18 @@ async function main() {
     const jsonlData = readJsonlFile(filePath);
     console.log(`Parsed ${jsonlData.length} entries`);
 
-    const profile = createFirefoxProfile(jsonlData);
-    console.log('Created Firefox profile');
+    const subagents = readSubagents(filePath);
+    if (subagents.length > 0) {
+      const entryCount = subagents.reduce((sum, agent) => sum + agent.entries.length, 0);
+      console.log(`Found ${subagents.length} sub-agents (${entryCount} entries)`);
+    }
+
+    const profile = createFirefoxProfile(jsonlData, subagents);
+    console.log(`Created Firefox profile with ${profile.threads.length} tracks`);
+
+    const cost = totalCost(conversationEntries(jsonlData)) +
+      subagents.reduce((sum, agent) => sum + totalCost(conversationEntries(agent.entries)), 0);
+    console.log(`Total cost: $${cost.toFixed(2)}`);
 
     const { server, serverUrl, shutdownRequested } = await startServer(profile);
     console.log(`Server started at ${serverUrl}`);
@@ -710,7 +1297,12 @@ async function main() {
   }
 }
 
-module.exports = { readJsonlFile, createFirefoxProfile };
+module.exports = {
+  readJsonlFile,
+  readSubagents,
+  readSubagentsForSession,
+  createFirefoxProfile
+};
 
 if (require.main === module) {
   main();

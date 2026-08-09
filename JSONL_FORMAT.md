@@ -11,6 +11,15 @@ Claude conversation logs are stored at:
 
 Each line in the file is a separate JSON object representing a log entry.
 
+Sub-agents spawned during the session get their own transcript files in a
+directory named after the session:
+```
+~/.claude/projects/[project]/[session-id]/subagents/agent-[agent-id].jsonl
+~/.claude/projects/[project]/[session-id]/subagents/agent-[agent-id].meta.json
+```
+
+See [Sub-agents](#sub-agents) below.
+
 ## Entry Structure
 
 ### Common Fields
@@ -26,6 +35,24 @@ All entries share these base fields:
 | `parentUuid` | string | UUID of the parent message in the conversation tree |
 | `sessionId` | string | Session identifier |
 | `message` | object | Contains the actual message data (see below) |
+
+### Other Entry Types
+
+Most entries are not messages. The ones carrying information worth using:
+
+| `type` | Fields | Description |
+|--------|--------|-------------|
+| `ai-title` | `aiTitle` | The generated title of the session. Rewritten as the conversation goes on, so the **last** one is current. No timestamp. |
+| `summary` | `summary` | Same idea in older sessions. |
+| `last-prompt` | `lastPrompt`, `leafUuid` | The most recent user prompt. |
+| `system` | `subtype`, `durationMs`, `messageCount`, `timestamp` | With `subtype: "turn_duration"`, the measured wall-clock duration of a turn — no need to infer it. |
+| `attachment` | `attachment.type` | Injected context (skill listings, task reminders, …). |
+| `mode`, `permission-mode` | `mode`, `permissionMode` | Current modes. **No timestamp**, so they cannot be placed on a timeline. |
+| `queue-operation` | `operation`, `content`, `timestamp` | Queue plumbing, mostly background-task notifications rather than typed prompts. |
+| `file-history-snapshot`, `file-history-delta` | `snapshot`, `backup`, `trackingPath` | File state tracking for rewinds. |
+
+Entries recording that the user stepped in: `toolDenialKind` (e.g.
+`"user-rejected"`) and `userFeedback` on `user` entries.
 
 ### Message Object
 
@@ -57,10 +84,28 @@ Content can be either:
 
 **Content Block Types:**
 - **Text blocks**: `{ "type": "text", "text": string }`
+- **Thinking blocks**: `{ "type": "thinking", "thinking": string, "signature": string }`
 - **Tool use blocks**: `{ "type": "tool_use", "id": string, "name": string, "input": object }`
-- **Tool result blocks**: `{ "type": "tool_result", "content": any, "tool_use_id": string }`
+- **Tool result blocks**: `{ "type": "tool_result", "content": any, "tool_use_id": string, "is_error": boolean }`
 
 **Important**: Not all entries have text content. Tool use and tool result entries often contain no displayable text.
+
+**Thinking is not recoverable**: thinking blocks keep their `signature` but the
+`thinking` string is always empty in the log, so the reasoning itself is not
+available.
+
+### Tool Calls
+
+A `tool_use` block is answered by a `tool_result` block with the same id, in a
+later `user` entry. The two timestamps give the duration of the call, and the
+pairing is reliable in practice. The answering entry also carries a
+`toolUseResult` object with the raw result: `stdout`/`stderr` for Bash,
+`filePath`/`structuredPatch` for edits, `interrupted`, `returnCodeInterpretation`,
+`backgroundTaskId` for backgrounded commands.
+
+Two tools return **before** their work is done, so their call duration is
+meaningless: `Task`/`Agent` (a few milliseconds; the real span is in the
+sub-agent transcript) and backgrounded Bash commands.
 
 ### Usage Object
 
@@ -77,6 +122,17 @@ The `usage` object tracks token consumption for API calls:
 **Optional nested cache fields:**
 - `cache_creation.ephemeral_5m_input_tokens`: Tokens for 5-minute ephemeral cache
 - `cache_creation.ephemeral_1h_input_tokens`: Tokens for 1-hour ephemeral cache
+
+**Other usage fields:** `speed` (e.g. `"standard"`), `iterations` (per-iteration
+usage of one request), `server_tool_use` (web search / fetch counts),
+`inference_geo`.
+
+**Context size** at the time of a call is everything the model was sent:
+`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`.
+
+The assistant entry also carries `effort` next to `message.model` and
+`message.stop_reason` (`"tool_use"` or `"end_turn"`, on the last entry of the
+response).
 
 **Important Notes:**
 - Only assistant response entries contain `usage` data
@@ -106,6 +162,53 @@ messages.forEach((msg) => {
   }
 });
 ```
+
+## Sub-agents
+
+Each sub-agent writes its own JSONL transcript under
+`[session-id]/subagents/agent-[agent-id].jsonl`, using the same entry format as
+the main session file. **These entries are not duplicated in the main session
+file**: their `requestId`s are disjoint from the parent's, so the tokens and
+cost of sub-agent work are entirely missing from the main file.
+
+Sub-agent entries carry two extra fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `isSidechain` | boolean | Always `true` for sub-agent entries |
+| `agentId` | string | The agent's id, matching the file name |
+
+Alongside each transcript is an `agent-[agent-id].meta.json`:
+
+```json
+{
+  "agentType": "general-purpose",
+  "description": "Narrow the a11y-checks invisible guard",
+  "toolUseId": "toolu_01TsKghgwyYPu7e71mt3timK",
+  "spawnDepth": 1
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agentType` | string | Agent type (`general-purpose`, `Explore`, …) |
+| `description` | string | Short task description given at spawn time |
+| `toolUseId` | string | `id` of the `Task`/`Agent` tool_use block that spawned it |
+| `spawnDepth` | number | 1 for agents spawned by the main session, 2+ for nested ones |
+
+### Attributing sub-agents to their spawner
+
+`toolUseId` points at the `tool_use` block that spawned the agent. That block
+lives in the main session file for `spawnDepth: 1`, and in *another sub-agent's*
+transcript for nested agents — all sub-agents, at any depth, are stored flat in
+the same `subagents/` directory.
+
+### Timing
+
+The `tool_result` for a `Task`/`Agent` tool_use comes back within a few
+milliseconds, because agents run in the background and report back through a
+later task notification. It is therefore **not** usable as the agent's end
+time. Use the first and last timestamps of the agent's own transcript instead.
 
 ## Example Entry
 
@@ -180,7 +283,7 @@ function calculateCost(usage, pricing) {
 
 ## Known Limitations
 
-1. **JSONL files may be incomplete**: The data in JSONL files doesn't always match the output of Claude's `/cost` command, which suggests the CLI uses a different or more complete data source for cost calculation.
+1. **JSONL files may be incomplete**: The data in JSONL files doesn't always match the output of Claude's `/cost` command, which suggests the CLI uses a different or more complete data source for cost calculation. Part of the gap is sub-agent work, which is logged in separate files (see [Sub-agents](#sub-agents)) and is easy to miss.
 
 2. **Token count discrepancies**: Aggregating tokens from JSONL entries may not match actual billed amounts shown by `/cost`.
 

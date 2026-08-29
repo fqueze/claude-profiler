@@ -324,5 +324,104 @@ check('every marker schema uses fields',
 check('no marker schema still uses data',
   timeline.meta.markerSchema.every(schema => schema.data === undefined), true);
 
+// The activity graph gives each sample the span between its neighbours, so with
+// only the moments something was logged a session that waited hours for its user
+// draws as busy throughout. Idle samples fill the gaps where neither the model
+// nor a tool was running.
+const idleCase = [
+  { uuid: 'i1', parentUuid: null, type: 'user', timestamp: '2026-01-01T00:00:00.000Z',
+    message: { role: 'user', content: 'start' } },
+  { uuid: 'i2', parentUuid: 'i1', type: 'assistant', requestId: 'q1',
+    timestamp: '2026-01-01T00:00:02.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5',
+      usage: { input_tokens: 10, output_tokens: 5 },
+      content: [{ type: 'text', text: 'working' }] } },
+  // An hour of nothing: the user walked away.
+  { uuid: 'i3', parentUuid: 'i2', type: 'user', timestamp: '2026-01-01T01:00:00.000Z',
+    message: { role: 'user', content: 'back' } },
+  { uuid: 'i4', parentUuid: 'i3', type: 'assistant', requestId: 'q2',
+    timestamp: '2026-01-01T01:00:02.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5',
+      usage: { input_tokens: 20, output_tokens: 5 },
+      content: [{ type: 'text', text: 'resuming' }] } }
+];
+
+const withIdle = createFirefoxProfile(idleCase, []);
+const idleThread = withIdle.threads[0];
+const idleShared = withIdle.shared;
+const idleCategory = withIdle.meta.categories.findIndex(c => c.name === 'Idle');
+
+// A category coloured `transparent` is what the front end draws as nothing, so
+// idle stretches read as empty without inventing any CPU measurement.
+check('the profile has an Idle category', idleCategory !== -1, true);
+check('idle draws as nothing', withIdle.meta.categories[idleCategory].color, 'transparent');
+
+// No CPU figures anywhere: there is no meaningful one here, and it would show up
+// in every tooltip along the timeline.
+check('no sampleUnits are declared', withIdle.meta.sampleUnits, undefined);
+check('samples carry no CPU deltas', idleThread.samples.threadCPUDelta, undefined);
+
+const categoryOf = (index) =>
+  idleShared.frameTable.category[idleShared.stackTable.frame[idleThread.samples.stack[index]]];
+
+let idleSamples = 0;
+let idleWeight = 0;
+for (let index = 0; index < idleThread.samples.length; index++) {
+  if (categoryOf(index) === idleCategory) {
+    idleSamples++;
+    idleWeight += idleThread.samples.weight[index];
+  }
+}
+check('the hour of nothing is sampled as idle', idleSamples > 1, true);
+check('idle samples carry no weight', idleWeight, 0);
+
+// The graph gives a sample the span from halfway back to the previous sample to
+// halfway on to the next, filled with that sample's own category, so two samples
+// bound a gap: everything between them is idle whatever its length.
+const times = idleThread.samples.time;
+const idleTimes = [];
+for (let index = 0; index < idleThread.samples.length; index++) {
+  if (categoryOf(index) === idleCategory) idleTimes.push(times[index]);
+}
+idleTimes.sort((a, b) => a - b);
+
+let widest = 0;
+let widestFrom = 0;
+for (let index = 1; index < idleTimes.length; index++) {
+  if (idleTimes[index] - idleTimes[index - 1] > widest) {
+    widest = idleTimes[index] - idleTimes[index - 1];
+    widestFrom = idleTimes[index - 1];
+  }
+}
+check('the idle hour is bounded by two idle samples',
+  Math.round(widest / 60000), 60);
+
+// Nothing busy may sit between them, or the gap would be filled as work.
+const busyInsideGap = [];
+for (let index = 0; index < idleThread.samples.length; index++) {
+  if (categoryOf(index) !== idleCategory &&
+      times[index] > widestFrom && times[index] < widestFrom + widest) {
+    busyInsideGap.push(times[index]);
+  }
+}
+check('nothing busy sits inside the idle hour', busyInsideGap, []);
+
+// Two samples per gap is the whole cost, so a long session stays cheap.
+check('a gap costs two samples, not one per interval', idleTimes.length <= 6, true);
+
+// Idle must not cover time when something was running, or the graph would show a
+// gap where there was work. The opening exchange ran in the first two seconds.
+let idleDuringWork = 0;
+for (let index = 0; index < idleThread.samples.length; index++) {
+  if (categoryOf(index) === idleCategory && times[index] > 0 && times[index] < 2000) {
+    idleDuringWork++;
+  }
+}
+check('no idle sample lands inside the opening exchange', idleDuringWork, 0);
+
+// The size profile measures bytes, not wall clock, so it has no idle to show.
+check('the size profile has no Idle category',
+  built.meta.categories.some(c => c.name === 'Idle'), false);
+
 console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);

@@ -458,6 +458,10 @@ function sourceSlug(label) {
   return (cleaned || 'session').slice(0, 60);
 }
 
+// Index into the timeline profile's category list below. Drawn as nothing, so an
+// idle stretch reads as empty rather than as another kind of work.
+const IDLE_CATEGORY = 6;
+
 // The size profile has its own category list; the timeline profile's is about
 // what happened rather than where bytes came from, so they are mapped over.
 function sizeCategoryToTimeline(category) {
@@ -826,6 +830,74 @@ function buildThread({
     }, transcript.lineFor);
   });
 
+  // Bytes only land on the moments something was logged, and the graph gives
+  // each sample the span between its neighbours, so a session that spent hours
+  // waiting for its user drew as busy throughout: the last sample before a gap
+  // was stretched across all of it.
+  //
+  // Filling the gaps with samples in a category whose colour is `transparent`
+  // is what the front end draws as nothing — the same way a profile without CPU
+  // measurements shows idle time. The alternative, a threadCPUDelta per sample,
+  // would also work but puts a CPU percentage in every tooltip along the
+  // timeline, and there is no CPU figure here that would mean anything.
+  const busy = [
+    ...findModelResponses(messages).map(response => ({
+      start: response.start - startTime,
+      end: response.end - startTime
+    })),
+    ...findToolCalls(messages).map(call => ({
+      start: call.start - startTime,
+      // A call with no result was still running when the log ended.
+      end: (call.end === null ? unregisterTime + startTime : call.end) - startTime
+    }))
+  ].filter(span => span.end >= span.start).sort((a, b) => a.start - b.start);
+
+  // Merged, since the model and its tools overlap and a gap only counts when
+  // nothing at all was running.
+  const busySpans = [];
+  for (const span of busy) {
+    const last = busySpans[busySpans.length - 1];
+    if (last && span.start <= last.end) {
+      last.end = Math.max(last.end, span.end);
+    } else {
+      busySpans.push({ ...span });
+    }
+  }
+
+  // Two samples per gap are enough. The graph gives a sample the span from
+  // halfway back to the previous sample to halfway on to the next, and fills it
+  // with that sample's own category — so one at each end of a gap covers all of
+  // it but the quarters nearest the work on either side, which belong to the
+  // work. A sample per second would change nothing about how it looks.
+  const idleStack = addStack(['Waiting'], IDLE_CATEGORY);
+
+  function markIdle(from, to) {
+    if (idleStack === null) return;
+    // The closing sample sits just short of where the work resumes: at the same
+    // timestamp it would tie with the work's own sample, and the second half of
+    // the gap would be filled as work.
+    const close = Math.max(from, to - 1);
+    for (const time of close === from ? [from] : [from, close]) {
+      sampleStacks.push(idleStack);
+      sampleTimes.push(time);
+      sampleWeights.push(0);
+    }
+  }
+
+  // Gaps between busy stretches, plus the head and tail of the track. Short
+  // gaps are left alone: they are pauses within a turn rather than waiting.
+  const IDLE_THRESHOLD = 2000;
+  let cursor = registerTime;
+  for (const span of busySpans) {
+    if (span.start - cursor > IDLE_THRESHOLD) {
+      markIdle(cursor, span.start);
+    }
+    cursor = Math.max(cursor, span.end);
+  }
+  if (unregisterTime - cursor > IDLE_THRESHOLD) {
+    markIdle(cursor, unregisterTime);
+  }
+
   // Samples have to be in time order. Messages are not strictly ordered by
   // timestamp within a thread, and one message contributes several samples, so
   // they are sorted rather than assumed to come out in order.
@@ -1055,6 +1127,11 @@ function createFirefoxProfile(jsonlData, subagents) {
     {
       name: 'Model',
       color: 'purple',
+      subcategories: ['Other']
+    },
+    {
+      name: 'Idle',
+      color: 'transparent',
       subcategories: ['Other']
     }
   ];

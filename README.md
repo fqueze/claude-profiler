@@ -187,6 +187,12 @@ the bytes, weight is how many — so the call tree and the flame graph work on t
 timeline profile too, as they would for an allocation profile. Selecting a range
 shows what filled the window during it.
 
+Time when neither the model nor a tool was running — the agent waiting for its
+user — is sampled into an `Idle` category, which the front end draws as nothing.
+Without it the activity graph stretches the last sample before a gap across all
+of it, and a session that spent hours waiting looks busy throughout: the 9.4 hour
+session above reads as 65% empty rather than 100% active.
+
 Counter graphs, sampled at every API call: `Context Size`, `Input Tokens`,
 `Output Tokens`, `Cache Read Tokens`, `Cache Creation Tokens`, `Cost ($)`,
 `Agent Cost ($)` — plus `Total Cost ($)` on the main track, sampled across every

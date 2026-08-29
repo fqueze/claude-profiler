@@ -226,20 +226,31 @@ function describeFrame(stage) {
 }
 
 // Everything the profile needs to know about one contribution of bytes.
+// The tables a whole profile shares: from v60 on the stack, frame, func and
+// resource tables live on profile.shared rather than per thread, so every track
+// interns into one set and only owns its samples.
+function createSharedTables() {
+  return {
+    strings: [],
+    stringMap: new Map(),
+    funcMap: new Map(),
+    frameMap: new Map(),
+    stackMap: new Map(),
+    frameTable: { func: [], category: [], line: [], source: [] },
+    stackTable: { frame: [], prefix: [] },
+    funcTable: { name: [], fileName: [], resource: [] },
+    resourceTable: { lib: [], name: [], host: [], type: [] },
+    // filename -> { index, content }
+    sources: new Map()
+  };
+}
+
 class SizeProfileBuilder {
-  // `shared` holds the string table, which the profile format keeps at
-  // profile.shared.stringArray for every thread at once. Each track still has
-  // its own frame and stack tables, since those are per-thread.
   constructor(shared) {
-    this.shared = shared || { strings: [], stringMap: new Map() };
+    this.shared = shared || createSharedTables();
     this.strings = this.shared.strings;
     this.stringMap = this.shared.stringMap;
-    this.funcMap = new Map();
-    this.frameMap = new Map();
-    this.stackMap = new Map();
-    this.frameTable = { func: [], category: [] };
-    this.stackTable = { frame: [], prefix: [] };
-    // stack index -> bytes
+    // stack index -> bytes, for this track only
     this.weights = new Map();
   }
 
@@ -251,40 +262,88 @@ class SizeProfileBuilder {
     return this.stringMap.get(text);
   }
 
-  frame(name, category) {
+  // `line` is where this frame's content sits in the transcript document, so
+  // that double-clicking the call node scrolls the source view to it. Frames
+  // sharing a name but coming from different places in the transcript are
+  // separate frames, since the line is per frame; they still share a func, so
+  // the call tree aggregates them under one name.
+  // A func is one name in one source file. Frames sharing a name but sitting at
+  // different lines of the transcript are separate frames, since the line is per
+  // frame, but they share a func so the call tree aggregates them by name.
+  func(name, sourceIndex) {
     const nameIndex = this.intern(name);
-    const key = `${nameIndex}:${category}`;
-    if (!this.frameMap.has(key)) {
-      this.frameMap.set(key, this.frameTable.func.length);
-      this.frameTable.func.push(nameIndex);
-      this.frameTable.category.push(category);
+    const key = `${nameIndex}:${sourceIndex === undefined ? 'x' : sourceIndex}`;
+    const { funcMap, funcTable } = this.shared;
+    if (!funcMap.has(key)) {
+      funcMap.set(key, funcTable.name.length);
+      funcTable.name.push(nameIndex);
+      funcTable.fileName.push(sourceIndex === undefined ? null : sourceIndex);
+      funcTable.resource.push(this.resourceIndex === undefined ? -1 : this.resourceIndex);
     }
-    return this.frameMap.get(key);
+    return funcMap.get(key);
   }
 
-  stack(frames, category) {
-    let prefix = null;
-    for (const name of frames) {
-      const frameIndex = this.frame(name, category);
-      const key = `${frameIndex}:${prefix === null ? 'r' : prefix}`;
-      if (!this.stackMap.has(key)) {
-        this.stackMap.set(key, this.stackTable.frame.length);
-        this.stackTable.frame.push(frameIndex);
-        this.stackTable.prefix.push(prefix);
-      }
-      prefix = this.stackMap.get(key);
+  frame(name, category, line) {
+    const funcIndex = this.func(name, this.sourceIndex);
+    const key = `${funcIndex}:${category}:${line === undefined ? 'x' : line}`;
+    const { frameMap, frameTable } = this.shared;
+    if (!frameMap.has(key)) {
+      frameMap.set(key, frameTable.func.length);
+      frameTable.func.push(funcIndex);
+      frameTable.category.push(category);
+      frameTable.line.push(line === undefined ? null : line);
     }
+    return frameMap.get(key);
+  }
+
+  // Only the leaf carries the line: the ancestors are groupings like
+  // `Bash (output)` that no single place in the transcript corresponds to.
+  stack(frames, category, line) {
+    let prefix = null;
+    frames.forEach((name, index) => {
+      const isLeaf = index === frames.length - 1;
+      const frameIndex = this.frame(name, category, isLeaf ? line : undefined);
+      const key = `${frameIndex}:${prefix === null ? 'r' : prefix}`;
+      const { stackMap, stackTable } = this.shared;
+      if (!stackMap.has(key)) {
+        stackMap.set(key, stackTable.frame.length);
+        stackTable.frame.push(frameIndex);
+        stackTable.prefix.push(prefix);
+      }
+      prefix = stackMap.get(key);
+    });
     return prefix;
   }
 
   // Adds bytes at a stack. Contributions to the same stack are summed, so the
   // sample count stays proportional to the number of distinct stacks rather
   // than to the number of messages.
-  add(frames, category, bytes) {
+  add(frames, category, bytes, line) {
     if (bytes <= 0 || frames.length === 0) return;
-    const stackIndex = this.stack(frames, category);
+    const stackIndex = this.stack(frames, category, line);
     if (stackIndex === null) return;
     this.weights.set(stackIndex, (this.weights.get(stackIndex) || 0) + bytes);
+  }
+
+  // Two samples per stack, as the JSON size profiler does: one at the start
+  // with no weight and one at the end carrying it, so that selecting a range
+  // in the timeline sums the bytes it covers.
+  // Registers this track's transcript as a source file with its content
+  // embedded, and a resource so funcs resolve to it. Called before attribution,
+  // so funcs created afterwards pick both up.
+  useSource(fileName, content, processName) {
+    const { sources, resourceTable } = this.shared;
+    if (!sources.has(fileName)) {
+      sources.set(fileName, { index: sources.size, content });
+    }
+    this.sourceIndex = sources.get(fileName).index;
+
+    this.resourceIndex = resourceTable.name.length;
+    resourceTable.lib.push(null);
+    resourceTable.name.push(this.intern(processName));
+    resourceTable.host.push(null);
+    // ResourceType.Url, since the "file" is a document rather than a library.
+    resourceTable.type.push(5);
   }
 
   // Two samples per stack, as the JSON size profiler does: one at the start
@@ -310,11 +369,6 @@ class SizeProfileBuilder {
       previous = position;
     }
 
-    const frameCount = this.frameTable.func.length;
-    // One func per interned string: funcTable.name indexes the shared string
-    // array, so every thread's table covers the whole array.
-    const funcCount = this.strings.length;
-
     return {
       processType: 'default',
       processName,
@@ -338,38 +392,85 @@ class SizeProfileBuilder {
       markers: {
         length: 0, category: [], data: [], endTime: [], name: [], phase: [], startTime: []
       },
-      stackTable: {
-        length: this.stackTable.frame.length,
-        prefix: this.stackTable.prefix,
-        frame: this.stackTable.frame
-      },
-      frameTable: {
-        length: frameCount,
-        address: new Array(frameCount).fill(-1),
-        category: this.frameTable.category,
-        subcategory: new Array(frameCount).fill(0),
-        func: this.frameTable.func,
-        nativeSymbol: new Array(frameCount).fill(null),
-        innerWindowID: new Array(frameCount).fill(0),
-        line: new Array(frameCount).fill(null),
-        column: new Array(frameCount).fill(null),
-        inlineDepth: new Array(frameCount).fill(0)
-      },
-      funcTable: {
-        length: funcCount,
-        name: Array.from({ length: funcCount }, (_, i) => i),
-        isJS: new Array(funcCount).fill(false),
-        relevantForJS: new Array(funcCount).fill(false),
-        resource: new Array(funcCount).fill(-1),
-        fileName: new Array(funcCount).fill(null),
-        lineNumber: new Array(funcCount).fill(null),
-        columnNumber: new Array(funcCount).fill(null)
-      },
-      resourceTable: { length: 0, lib: [], name: [], host: [], type: [] },
-      nativeSymbols: { length: 0, address: [], functionSize: [], libIndex: [], name: [] },
       totalBytes: position
     };
   }
+}
+
+// The shared half of the profile: the tables every thread indexes into, plus
+// the sources table carrying each transcript inline. Embedding the text is what
+// makes the source view work without a symbol server, and keeps a saved or
+// shared profile readable on its own.
+function buildSharedData(shared) {
+  const frameCount = shared.frameTable.func.length;
+  const funcCount = shared.funcTable.name.length;
+  const resourceCount = shared.resourceTable.name.length;
+
+  const sources = {
+    length: shared.sources.size,
+    id: new Array(shared.sources.size).fill(null),
+    filename: [],
+    startLine: new Array(shared.sources.size).fill(1),
+    startColumn: new Array(shared.sources.size).fill(1),
+    sourceMapURL: new Array(shared.sources.size).fill(null),
+    content: []
+  };
+  const internShared = (text) => {
+    if (!shared.stringMap.has(text)) {
+      shared.stringMap.set(text, shared.strings.length);
+      shared.strings.push(text);
+    }
+    return shared.stringMap.get(text);
+  };
+
+  for (const [fileName, source] of shared.sources) {
+    sources.filename[source.index] = internShared(fileName);
+    sources.content[source.index] = source.content;
+  }
+
+  return {
+    stringArray: shared.strings,
+    stackTable: {
+      length: shared.stackTable.frame.length,
+      prefix: shared.stackTable.prefix,
+      frame: shared.stackTable.frame
+    },
+    frameTable: {
+      length: frameCount,
+      address: new Array(frameCount).fill(-1),
+      inlineDepth: new Array(frameCount).fill(0),
+      category: shared.frameTable.category,
+      subcategory: new Array(frameCount).fill(0),
+      func: shared.frameTable.func,
+      nativeSymbol: new Array(frameCount).fill(null),
+      innerWindowID: new Array(frameCount).fill(null),
+      line: shared.frameTable.line,
+      column: new Array(frameCount).fill(null),
+      originalLocation: new Array(frameCount).fill(null)
+    },
+    funcTable: {
+      length: funcCount,
+      name: shared.funcTable.name,
+      isJS: new Array(funcCount).fill(false),
+      relevantForJS: new Array(funcCount).fill(false),
+      resource: shared.funcTable.resource,
+      // From v58 on a func points at the sources table rather than a filename.
+      source: shared.funcTable.fileName,
+      lineNumber: new Array(funcCount).fill(null),
+      columnNumber: new Array(funcCount).fill(null),
+      originalLocation: new Array(funcCount).fill(null)
+    },
+    resourceTable: {
+      length: resourceCount,
+      lib: shared.resourceTable.lib,
+      name: shared.resourceTable.name,
+      host: shared.resourceTable.host,
+      type: shared.resourceTable.type
+    },
+    nativeSymbols: { length: 0, address: [], functionSize: [], libIndex: [], name: [] },
+    sources,
+    sourceLocationTable: { source: [], line: [], column: [], length: 0 }
+  };
 }
 
 // The path or subject a tool call acted on, used as the second frame so that
@@ -417,5 +518,7 @@ module.exports = {
   resultText,
   echoOutput,
   describeFrame,
-  summarizeNames
+  summarizeNames,
+  createSharedTables,
+  buildSharedData
 };

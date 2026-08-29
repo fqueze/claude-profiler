@@ -20,9 +20,12 @@ const {
   byteLength,
   resultText,
   describeFrame,
-  summarizeNames
+  summarizeNames,
+  createSharedTables,
+  buildSharedData
 } = require('./size-profile.js');
 const { parseCommand } = require('./shell-parse.js');
+const { renderTranscript } = require('./transcript.js');
 
 function contextTokens(usage) {
   return (usage.input_tokens || 0) +
@@ -105,13 +108,17 @@ function calibrate(points) {
 
 // Attributes the bytes of one message to stacks. `add(frames, category, bytes)`
 // is called once per contribution.
-function attributeEntry(entry, toolUses, add) {
+function attributeEntry(entry, toolUses, add, lineFor) {
   const content = entry.message?.content;
   const role = entry.message?.role || entry.type;
+  // Where this content sits in the transcript document, so the source view can
+  // scroll to it. Absent when no transcript was rendered.
+  const lineOf = key => (lineFor ? lineFor.get(key) : undefined);
 
   if (typeof content === 'string') {
     const category = role === 'user' ? CATEGORY['User text'] : CATEGORY['Assistant text'];
-    add([role === 'user' ? 'User prompt' : 'Assistant text'], category, byteLength(content));
+    add([role === 'user' ? 'User prompt' : 'Assistant text'], category,
+      byteLength(content), lineOf(entry.uuid));
     return;
   }
 
@@ -120,7 +127,8 @@ function attributeEntry(entry, toolUses, add) {
   for (const block of content) {
     if (block.type === 'text') {
       const category = role === 'user' ? CATEGORY['User text'] : CATEGORY['Assistant text'];
-      add([role === 'user' ? 'User prompt' : 'Assistant text'], category, byteLength(block.text));
+      add([role === 'user' ? 'User prompt' : 'Assistant text'], category,
+        byteLength(block.text), lineOf(entry.uuid));
       continue;
     }
 
@@ -151,7 +159,7 @@ function attributeEntry(entry, toolUses, add) {
         frames.push(subject);
       }
 
-      add(frames, CATEGORY['Tool call'], bytes);
+      add(frames, CATEGORY['Tool call'], bytes, lineOf(`${block.id}:call`));
       continue;
     }
 
@@ -160,15 +168,17 @@ function attributeEntry(entry, toolUses, add) {
       const name = use ? use.name : 'unknown tool';
       const text = resultText(block);
 
+      const outputLine = lineOf(`${block.tool_use_id}:output`);
+
       if (use && use.name === 'Bash') {
-        attributeBashOutput(use, text, add);
+        attributeBashOutput(use, text, add, outputLine);
         continue;
       }
 
       const frames = [`${name} (output)`];
       const subject = use ? toolSubject(name, use.input) : null;
       if (subject) frames.push(subject);
-      add(frames, CATEGORY['Tool output'], byteLength(text));
+      add(frames, CATEGORY['Tool output'], byteLength(text), outputLine);
       continue;
     }
 
@@ -179,29 +189,49 @@ function attributeEntry(entry, toolUses, add) {
 }
 
 // A Bash call's output, split among the commands that produced it.
-function attributeBashOutput(use, output, add) {
+function attributeBashOutput(use, output, add, outputLine) {
   const command = use.input?.command || '';
   const segments = parseCommand(command);
 
   if (segments.length === 0) {
-    add(['Bash (output)'], CATEGORY['Tool output'], byteLength(output));
+    add(['Bash (output)'], CATEGORY['Tool output'], byteLength(output), outputLine);
     return;
   }
 
+  // Each chunk points at its own place within the output, so double-clicking a
+  // command in the tree lands on what that command printed rather than at the
+  // top of a long combined output.
+  let consumed = 0;
   for (const chunk of splitOutputByEchoes(output, segments)) {
     const bytes = byteLength(chunk.text);
-    if (bytes === 0) continue;
+    const newlines = countNewlines(chunk.text);
+    if (bytes === 0) {
+      consumed += newlines;
+      continue;
+    }
     const isSeparator = chunk.segments.length === 1 && chunk.segments[0].isEcho;
     add(
       ['Bash (output)', ...bashFrames(chunk)],
       isSeparator ? CATEGORY.Other : CATEGORY['Tool output'],
-      bytes
+      bytes,
+      outputLine === undefined ? undefined : outputLine + consumed
     );
+    consumed += newlines;
   }
 }
 
+function countNewlines(text) {
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\n') count++;
+  }
+  return count;
+}
+
 // Builds one track: the context window of one agent at the point given.
-function buildTrack({ entries, byUuid, boundaries, name, processName, pid, atCall, shared }) {
+function buildTrack({
+  entries, byUuid, boundaries, name, processName, pid, atCall, shared, options = {}
+}) {
   const calls = apiCalls(entries);
   if (calls.length === 0) return null;
 
@@ -235,12 +265,21 @@ function buildTrack({ entries, byUuid, boundaries, name, processName, pid, atCal
     }
   }
 
-  const builder = new SizeProfileBuilder(shared);
-  const add = (frames, category, bytes) => builder.add(frames, category, bytes);
+  // The transcript of exactly what is in this window, so the source view shows
+  // the context and nothing else. Oldest first, in conversation order.
+  const resident = [...chosen.chain].reverse();
+  const transcript = renderTranscript(resident, toolUses, {
+    title: name,
+    subtitle: `${processName} — context window at ${chosen.call.timestamp}`
+  });
 
-  // Oldest first, so the profile reads in conversation order.
-  for (const entry of [...chosen.chain].reverse()) {
-    attributeEntry(entry, toolUses, add);
+  const builder = new SizeProfileBuilder(shared);
+  builder.useSource(options.sourceFile, transcript.text, processName);
+  const add = (frames, category, bytes, line) =>
+    builder.add(frames, category, bytes, line);
+
+  for (const entry of resident) {
+    attributeEntry(entry, toolUses, add, transcript.lineFor);
   }
 
   // The part of the window that is not in the log at all. Shown so the tree
@@ -258,6 +297,7 @@ function buildTrack({ entries, byUuid, boundaries, name, processName, pid, atCal
 
   return {
     thread,
+    transcript,
     calibration,
     reportedTokens: chosen.tokens,
     timestamp: chosen.call.timestamp,
@@ -285,9 +325,21 @@ function createSizeProfile(jsonlData, subagents, options = {}) {
   register(jsonlData);
   (subagents || []).forEach(agent => register(agent.entries));
 
-  // One string table for the whole profile: the format keeps it at
-  // profile.shared.stringArray rather than per thread.
-  const shared = { strings: [], stringMap: new Map() };
+  // One string table and one set of stack/frame/func tables for the whole
+  // profile: from v60 on they live on profile.shared rather than per thread.
+  const shared = createSharedTables();
+
+  // Each track's transcript becomes a source file whose content is embedded in
+  // the profile, so the source view reads it directly — no symbol server, and a
+  // saved profile stays readable on its own.
+  const usedNames = new Map();
+  const trackSource = (label) => {
+    const base = `${slug(label)}.context.txt`;
+    const seen = usedNames.get(base) || 0;
+    usedNames.set(base, seen + 1);
+    // Two sub-agents can share a description, and a source file is keyed by name.
+    return { sourceFile: seen === 0 ? base : `${slug(label)}-${seen + 1}.context.txt` };
+  };
 
   const tracks = [];
   const main = buildTrack({
@@ -298,7 +350,8 @@ function createSizeProfile(jsonlData, subagents, options = {}) {
     processName: 'Main conversation',
     pid: 0,
     atCall,
-    shared
+    shared,
+    options: trackSource(sessionName(jsonlData))
   });
 
   if (!main) {
@@ -315,7 +368,8 @@ function createSizeProfile(jsonlData, subagents, options = {}) {
       processName: `${agent.meta.agentType || 'agent'} (depth ${agent.meta.spawnDepth || 1})`,
       pid: index + 1,
       atCall,
-      shared
+      shared,
+      options: trackSource(agent.meta.description || agent.id)
     });
     if (track) tracks.push(track);
   });
@@ -324,8 +378,11 @@ function createSizeProfile(jsonlData, subagents, options = {}) {
 
   return {
     meta: {
-      version: 56,
-      preprocessedProfileVersion: 56,
+      // v64 is the first version whose sources table has a `content` column,
+      // which is where each transcript is embedded. Earlier versions get their
+      // sources table rebuilt by the upgraders, which would drop the content.
+      version: 64,
+      preprocessedProfileVersion: 64,
       startTime: 0,
       processType: 0,
       product: `Claude context size — ${sessionName(jsonlData)}`,
@@ -343,31 +400,25 @@ function createSizeProfile(jsonlData, subagents, options = {}) {
     libs: [],
     threads: tracks.map(track => {
       const { totalBytes: _ignored, ...thread } = track.thread;
-      // funcTable.name indexes the shared string array, so it can only be
-      // sized once every track has finished interning into it.
-      return { ...thread, funcTable: buildFuncTable(shared.strings.length) };
+      return thread;
     }),
     profilingLog: [],
-    shared: { stringArray: shared.strings },
+    // Built last, once every track has interned into the shared tables.
+    shared: buildSharedData(shared),
     // Reporting data for the CLI, not part of the profile format.
     tracks,
     totalBytes
   };
 }
 
-// One func per interned string, so that a frame's func index is the string
-// index. Shared by every thread, since the string array is.
-function buildFuncTable(count) {
-  return {
-    length: count,
-    name: Array.from({ length: count }, (_, i) => i),
-    isJS: new Array(count).fill(false),
-    relevantForJS: new Array(count).fill(false),
-    resource: new Array(count).fill(-1),
-    fileName: new Array(count).fill(null),
-    lineNumber: new Array(count).fill(null),
-    columnNumber: new Array(count).fill(null)
-  };
+// A filename made from a track's name: it is shown in the source view's header
+// and used as the key the source is looked up by.
+function slug(label) {
+  const cleaned = String(label || 'session')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return (cleaned || 'session').slice(0, 60);
 }
 
 function sessionName(jsonlData) {

@@ -161,5 +161,67 @@ check('calibration reports it fitted', fit.fitted, true);
 // Too few points to fit: falls back rather than dividing by zero.
 check('calibration falls back on tiny input', calibrate([{ bytes: 10, tokens: 5 }]).fitted, false);
 
+// The transcript is what the source view shows, and a frame's line has to point
+// at the content that frame is about, or double-clicking lands in the wrong place.
+const { renderTranscript } = require('./transcript.js');
+
+const toolUse = {
+  id: 'tu1',
+  type: 'tool_use',
+  name: 'Bash',
+  input: { command: 'echo "=== hello ==="; ls' }
+};
+const sessionEntries = [
+  {
+    uuid: 'u1',
+    type: 'user',
+    timestamp: '2026-08-28T21:08:21.312Z',
+    message: { role: 'user', content: 'please list the files' }
+  },
+  {
+    uuid: 'u2',
+    type: 'assistant',
+    timestamp: '2026-08-28T21:08:25.000Z',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Listing them.' }, toolUse] }
+  },
+  {
+    uuid: 'u3',
+    type: 'user',
+    timestamp: '2026-08-28T21:08:26.000Z',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: '=== hello ===\nfile-a\nfile-b\n' }]
+    }
+  }
+];
+
+const rendered = renderTranscript(sessionEntries, new Map([['tu1', toolUse]]), {
+  title: 'test session'
+});
+const documentLines = rendered.text.split('\n');
+const at = (line) => documentLines[line - 1];
+
+check('transcript keys the user prompt', at(rendered.lineFor.get('u1')),
+  'please list the files');
+check('transcript keys the assistant text', at(rendered.lineFor.get('u2')),
+  'Listing them.');
+check('transcript keys the tool call', at(rendered.lineFor.get('tu1:call')),
+  'echo "=== hello ==="; ls');
+check('transcript keys the tool output', at(rendered.lineFor.get('tu1:output')),
+  '=== hello ===');
+
+// The command is shown above its output, so the view has context for the bytes.
+check('output is preceded by its command',
+  at(rendered.lineFor.get('tu1:output') - 1),
+  '$ echo "=== hello ==="; ls');
+
+// Lines are 1-based, as the source view expects.
+check('lines are 1-based', Math.min(...rendered.lineFor.values()) >= 1, true);
+
+// Every recorded line must exist in the document.
+check('every keyed line is inside the document',
+  [...rendered.lineFor.values()].every(line => line >= 1 && line <= rendered.lineCount),
+  true);
+
 console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);

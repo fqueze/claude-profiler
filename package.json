@@ -21,6 +21,7 @@
     "context-size.js",
     "size-profile.js",
     "shell-parse.js",
+    "transcript.js",
     "JSONL_FORMAT.md",
     "README.md"
   ]

@@ -1153,33 +1153,41 @@ function createFirefoxProfile(jsonlData, subagents) {
   return profile;
 }
 
-function startServer(profileData) {
+// The profiler front end fetches the profile from the browser, so it has to be
+// told which origin is allowed to read it. profiler.firefox.com is the hosted
+// front end; a local checkout runs on http://localhost:4242 by default.
+const DEFAULT_PROFILER_ORIGIN = 'https://profiler.firefox.com';
+
+function startServer(profileData, profilerOrigin) {
   return new Promise((resolve) => {
     let shutdownRequested = false;
 
     const server = http.createServer((req, res) => {
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': 'https://profiler.firefox.com'
+        'Access-Control-Allow-Origin': profilerOrigin
       });
       res.end(JSON.stringify(profileData));
       shutdownRequested = true;
     });
 
-    server.listen(0, 'localhost', () => {
-      const { address, port } = server.address();
-      const serverUrl = `http://${address}:${port}/`;
+    // Bound to the IPv4 loopback explicitly: listening on 'localhost' resolves
+    // to ::1 on some systems, and the bare IPv6 address it reports back makes
+    // an invalid URL (http://::1:1234/) that the front end cannot fetch.
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      const serverUrl = `http://127.0.0.1:${port}/`;
       resolve({ server, serverUrl, shutdownRequested: () => shutdownRequested });
     });
   });
 }
 
-async function openProfiler(serverUrl) {
+async function openProfiler(serverUrl, profilerOrigin) {
   // `thread=0` makes the front end treat the track layout as coming from the
   // URL, which skips the default ordering pass — that pass sorts process tracks
   // by activity score and would scramble the order the threads are in.
   const profilerUrl =
-    `https://profiler.firefox.com/from-url/${encodeURIComponent(serverUrl)}?thread=0`;
+    `${profilerOrigin}/from-url/${encodeURIComponent(serverUrl)}?thread=0`;
 
   // Try to open with xdg-open on Linux, open on macOS, or start on Windows
   const command = process.platform === 'darwin' ? 'open' :
@@ -1197,15 +1205,29 @@ async function openProfiler(serverUrl) {
 async function main() {
   const args = process.argv.slice(2);
 
-  if (args.length === 0) {
-    console.error('Usage: claude-profiler <jsonl-file>');
-    console.error('Example: claude-profiler ~/.claude/projects/my-session.jsonl');
+  // Optional --profiler-origin, for pointing at a local front-end checkout
+  // instead of the hosted profiler.
+  let profilerOrigin = process.env.PROFILER_ORIGIN || DEFAULT_PROFILER_ORIGIN;
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--profiler-origin') {
+      profilerOrigin = args[++i];
+    } else if (args[i].startsWith('--profiler-origin=')) {
+      profilerOrigin = args[i].slice('--profiler-origin='.length);
+    } else {
+      positional.push(args[i]);
+    }
+  }
+
+  if (positional.length === 0 || !profilerOrigin) {
+    console.error('Usage: claude-profiler <jsonl-file> [--profiler-origin <url>]');
+    console.error('Example: claude-profiler ~/.claude/projects/my-project/my-session.jsonl');
     process.exit(1);
   }
 
-  const filePath = args[0].startsWith('~')
-    ? path.join(process.env.HOME, args[0].slice(1))
-    : path.resolve(args[0]);
+  const filePath = positional[0].startsWith('~')
+    ? path.join(os.homedir(), positional[0].slice(1))
+    : path.resolve(positional[0]);
 
   if (!fs.existsSync(filePath)) {
     console.error(`Error: File not found: ${filePath}`);
@@ -1231,10 +1253,10 @@ async function main() {
       subagents.reduce((sum, agent) => sum + totalCost(conversationEntries(agent.entries)), 0);
     console.log(`Total cost: $${cost.toFixed(2)}`);
 
-    const { server, serverUrl, shutdownRequested } = await startServer(profile);
+    const { server, serverUrl, shutdownRequested } = await startServer(profile, profilerOrigin);
     console.log(`Server started at ${serverUrl}`);
 
-    await openProfiler(serverUrl);
+    await openProfiler(serverUrl, profilerOrigin);
 
     // Wait for the profile to be fetched
     const checkInterval = setInterval(() => {

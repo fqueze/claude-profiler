@@ -237,5 +237,75 @@ check('every keyed line is inside the document',
   [...rendered.lineFor.values()].every(line => line >= 1 && line <= rendered.lineCount),
   true);
 
+// The source view scrolls to the heaviest line of a call node, and a call node
+// merges every frame sharing a func — so a name that occurs in several places
+// must not share a func at its leaf, or a double-click lands somewhere else.
+const { createSizeProfile } = require('./context-size.js');
+
+const twoPlaces = [
+  { uuid: 'a1', parentUuid: null, type: 'user', timestamp: '2026-01-01T00:00:00.000Z',
+    message: { role: 'user', content: 'go' } },
+  { uuid: 'a2', parentUuid: 'a1', type: 'assistant', requestId: 'r1',
+    timestamp: '2026-01-01T00:00:01.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 5 },
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'sed -n 1,5p a' } }] } },
+  { uuid: 'a3', parentUuid: 'a2', type: 'user', timestamp: '2026-01-01T00:00:02.000Z',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'AAA\nBBB\n' }] } },
+  { uuid: 'a4', parentUuid: 'a3', type: 'assistant', requestId: 'r2',
+    timestamp: '2026-01-01T00:00:03.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5', usage: { input_tokens: 20, output_tokens: 5 },
+      content: [{ type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'sed -n 90,99p b' } }] } },
+  { uuid: 'a5', parentUuid: 'a4', type: 'user', timestamp: '2026-01-01T00:00:04.000Z',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'CCC\nDDD\n' }] } }
+];
+
+const built = createSizeProfile(twoPlaces, [], { at: 'last' });
+const builtShared = built.shared;
+
+// Every func that carries a line must carry exactly one, or the scroll target is
+// ambiguous for the boxes sharing it.
+const linesPerFunc = new Map();
+for (let frame = 0; frame < builtShared.frameTable.length; frame++) {
+  const line = builtShared.frameTable.line[frame];
+  if (line === null) continue;
+  const func = builtShared.frameTable.func[frame];
+  if (!linesPerFunc.has(func)) linesPerFunc.set(func, new Set());
+  linesPerFunc.get(func).add(line);
+}
+check('no func carries more than one line',
+  [...linesPerFunc.values()].filter(lines => lines.size > 1).length, 0);
+
+// The two `sed -n` calls still aggregate under one frame name, one level above
+// the leaves that hold their lines.
+const frameName = (frame) =>
+  builtShared.stringArray[builtShared.funcTable.name[builtShared.frameTable.func[frame]]];
+const names = [];
+for (let frame = 0; frame < builtShared.frameTable.length; frame++) {
+  names.push(frameName(frame));
+}
+// Call nodes merge by func, so what matters is that the repeated command shares
+// one func. It still gets a frame per category, since the command text and the
+// output it produced are coloured differently.
+const funcsNamed = (wanted) => {
+  const found = new Set();
+  for (let frame = 0; frame < builtShared.frameTable.length; frame++) {
+    if (frameName(frame) === wanted) found.add(builtShared.frameTable.func[frame]);
+  }
+  return found.size;
+};
+check('the repeated command shares one func', funcsNamed('sed -n'), 1);
+check('each occurrence gets its own leaf',
+  names.filter(name => name.startsWith('line ')).length >= 2, true);
+
+// Marker schemas must use `fields`: the rename from `data` happened in format
+// v55, and these profiles declare v64, so no upgrader will fix it. A schema
+// left with `data` makes the front end throw when a marker is hovered.
+const { createFirefoxProfile } = require('./index.js');
+const timeline = createFirefoxProfile(twoPlaces, []);
+check('every marker schema uses fields',
+  timeline.meta.markerSchema.every(schema => Array.isArray(schema.fields)), true);
+check('no marker schema still uses data',
+  timeline.meta.markerSchema.every(schema => schema.data === undefined), true);
+
 console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);

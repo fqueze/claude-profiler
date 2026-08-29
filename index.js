@@ -772,12 +772,17 @@ function buildThread({
   }
 
   const stackIndexes = shared.stackIndexes;
-  // Only the leaf carries a line: the ancestors are groupings that no single
-  // place in the transcript corresponds to.
+  // A call node merges every frame sharing a func, and the source view scrolls
+  // to the heaviest line within a node, so a name occurring in many places would
+  // scroll somewhere unrelated to the box that was clicked. The location gets a
+  // leaf frame of its own below the frames that aggregate by name: parents stay
+  // merged, the leaf scrolls exactly.
   function addStack(frames, category, line) {
+    const path = line === undefined ? frames : [...frames, `line ${line}`];
+
     let prefix = null;
-    frames.forEach((name, index) => {
-      const isLeaf = index === frames.length - 1;
+    path.forEach((name, index) => {
+      const isLeaf = index === path.length - 1;
       const frameIndex = addFrame(name, category, isLeaf ? line : undefined);
       const key = `${frameIndex}\u0000${prefix === null ? 'r' : prefix}`;
       if (!stackIndexes.has(key)) {
@@ -1059,12 +1064,11 @@ function createFirefoxProfile(jsonlData, subagents) {
       tableLabel: '{marker.data.text}',
       chartLabel: '{marker.name}',
       display: ['marker-chart', 'marker-table'],
-      data: [
+      fields: [
         {
           key: 'text',
           label: 'Content',
-          format: 'string',
-          searchable: true
+          format: 'string'
         }
       ]
     },
@@ -1074,18 +1078,16 @@ function createFirefoxProfile(jsonlData, subagents) {
       tableLabel: '{marker.data.model} ({marker.data.stopReason})',
       chartLabel: '{marker.data.stopReason}',
       display: ['marker-chart', 'marker-table', 'timeline-overview'],
-      data: [
+      fields: [
         {
           key: 'model',
           label: 'Model',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'effort',
           label: 'Effort',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'speed',
@@ -1095,8 +1097,7 @@ function createFirefoxProfile(jsonlData, subagents) {
         {
           key: 'stopReason',
           label: 'Stop reason',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'outputTokens',
@@ -1116,7 +1117,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       tableLabel: '{marker.name} ({marker.data.messages} messages)',
       chartLabel: '{marker.name}',
       display: ['marker-chart', 'marker-table'],
-      data: [
+      fields: [
         {
           key: 'messages',
           label: 'Messages in context',
@@ -1135,18 +1136,16 @@ function createFirefoxProfile(jsonlData, subagents) {
       tableLabel: '{marker.name}: {marker.data.kind}',
       chartLabel: '{marker.data.kind}',
       display: ['marker-chart', 'marker-table', 'timeline-overview'],
-      data: [
+      fields: [
         {
           key: 'kind',
           label: 'Kind',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'text',
           label: 'Content',
-          format: 'string',
-          searchable: true
+          format: 'string'
         }
       ]
     },
@@ -1156,12 +1155,11 @@ function createFirefoxProfile(jsonlData, subagents) {
       tableLabel: '{marker.data.name} — {marker.data.detail}',
       chartLabel: '{marker.data.detail}',
       display: ['marker-chart', 'marker-table', 'timeline-overview'],
-      data: [
+      fields: [
         {
           key: 'detail',
           label: 'Input',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'outputBytes',
@@ -1171,8 +1169,7 @@ function createFirefoxProfile(jsonlData, subagents) {
         {
           key: 'status',
           label: 'Status',
-          format: 'string',
-          searchable: true
+          format: 'string'
         }
       ]
     },
@@ -1182,24 +1179,21 @@ function createFirefoxProfile(jsonlData, subagents) {
       tableLabel: '{marker.data.agentType}: {marker.data.description}',
       chartLabel: '{marker.data.description}',
       display: ['marker-chart', 'marker-table', 'timeline-overview'],
-      data: [
+      fields: [
         {
           key: 'description',
           label: 'Task',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'agentType',
           label: 'Agent type',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'agentId',
           label: 'Agent id',
-          format: 'string',
-          searchable: true
+          format: 'string'
         },
         {
           key: 'cost',
@@ -1212,7 +1206,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'ContextSize',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'tokens',
           label: 'Context Size',
@@ -1227,7 +1221,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'OutputTokens',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'count',
           label: 'Output Tokens',
@@ -1242,7 +1236,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'InputTokens',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'count',
           label: 'Input Tokens',
@@ -1257,7 +1251,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'CacheReadTokens',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'count',
           label: 'Cache Read Tokens',
@@ -1272,7 +1266,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'CacheCreationTokens',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'count',
           label: 'Cache Creation Tokens',
@@ -1287,7 +1281,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'Cost',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'cost',
           label: 'Cost',
@@ -1322,7 +1316,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'AgentCost',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'total',
           label: 'Agent Cost (cumulative)',
@@ -1337,7 +1331,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'TotalCost',
       tooltipLabel: '{marker.name}',
       display: [],
-      data: [
+      fields: [
         {
           key: 'total',
           label: 'Total Cost',
@@ -1388,14 +1382,42 @@ const DEFAULT_PROFILER_ORIGIN = 'https://profiler.firefox.com';
 function startServer(profileData, profilerOrigin) {
   return new Promise((resolve) => {
     let shutdownRequested = false;
+    // Serialized once: the profile embeds the session transcripts, so this is
+    // megabytes of JSON that every request would otherwise rebuild.
+    const body = Buffer.from(JSON.stringify(profileData), 'utf8');
 
     const server = http.createServer((req, res) => {
+      // A CORS preflight carries no body and must not be answered with one.
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': profilerOrigin,
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400'
+        });
+        res.end();
+        return;
+      }
+
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
+        // A Buffer's length is the byte count, which is what this header means:
+        // the profile contains non-ASCII text, so a string's length would be
+        // short of it and the response would look truncated.
+        'Content-Length': body.length,
         'Access-Control-Allow-Origin': profilerOrigin
       });
-      res.end(JSON.stringify(profileData));
-      shutdownRequested = true;
+
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+
+      // Only once the body has actually gone out: res.end() queues the write
+      // rather than completing it, and closing the server before it drains
+      // truncates the response mid-body.
+      res.end(body, () => {
+        shutdownRequested = true;
+      });
     });
 
     // Bound to the IPv4 loopback explicitly: listening on 'localhost' resolves

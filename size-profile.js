@@ -284,6 +284,8 @@ class SizeProfileBuilder {
   }
 
   frame(name, category, line) {
+    // Only a leaf carries a line, and a leaf's name already encodes it, so the
+    // func is unique per location there and shared per name above.
     const funcIndex = this.func(name, this.sourceIndex);
     const key = `${funcIndex}:${category}:${line === undefined ? 'x' : line}`;
     const { frameMap, frameTable } = this.shared;
@@ -296,12 +298,19 @@ class SizeProfileBuilder {
     return frameMap.get(key);
   }
 
-  // Only the leaf carries the line: the ancestors are groupings like
-  // `Bash (output)` that no single place in the transcript corresponds to.
+  // A call node merges every frame that shares a func, and the source view
+  // scrolls to the heaviest line within a node — so a name that occurs in many
+  // places would scroll somewhere unrelated to the box that was clicked. The
+  // location therefore gets a leaf frame of its own, below the frames that
+  // aggregate by name: the parents stay merged, the leaf scrolls exactly.
   stack(frames, category, line) {
+    const path = line === undefined
+      ? frames
+      : [...frames, `line ${line}`];
+
     let prefix = null;
-    frames.forEach((name, index) => {
-      const isLeaf = index === frames.length - 1;
+    path.forEach((name, index) => {
+      const isLeaf = index === path.length - 1;
       const frameIndex = this.frame(name, category, isLeaf ? line : undefined);
       const key = `${frameIndex}:${prefix === null ? 'r' : prefix}`;
       const { stackMap, stackTable } = this.shared;

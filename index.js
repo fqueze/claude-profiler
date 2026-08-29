@@ -5,6 +5,9 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+// Attribution of a message's bytes, shared with the size profile so both tools
+// build the same stacks.
+const { attributeEntry } = require('./context-size.js');
 
 // Prices per million tokens, from
 // https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-08-09).
@@ -336,6 +339,20 @@ function findAgentToolUses(messages) {
   return toolUses;
 }
 
+// The size profile has its own category list; the timeline profile's is about
+// what happened rather than where bytes came from, so they are mapped over.
+function sizeCategoryToTimeline(category) {
+  const { CATEGORY } = require('./size-profile.js');
+  switch (category) {
+    case CATEGORY['Tool output']: return 3;      // Tools
+    case CATEGORY['Tool call']: return 3;        // Tools
+    case CATEGORY['Assistant text']: return 5;   // Model
+    case CATEGORY['User text']: return 1;        // Messages
+    case CATEGORY['Injected context']: return 1; // Messages
+    default: return 0;                           // Other
+  }
+}
+
 function buildThread({
   entries,
   messages,
@@ -360,8 +377,6 @@ function buildThread({
     }
     return stringTable.get(str);
   }
-
-  const rootStrIdx = addString('(root)');
 
   const markers = {
     data: [],
@@ -581,49 +596,117 @@ function buildThread({
     });
   }
 
-  // Create samples (one sample per message with text)
-  const samples = {
-    length: messagesWithText.length,
-    stack: new Array(messagesWithText.length).fill(0),
-    time: messagesWithText.map(msg => new Date(msg.timestamp).getTime() - startTime),
-    weight: null,
-    weightType: 'samples'
-  };
-
-  // Create stack table (simple: just one stack frame)
-  const stackTable = {
-    frame: [0],
-    prefix: [null],
-    category: [0],
-    subcategory: [0],
-    length: 1
-  };
-
-  // Create frame table
+  // Samples carry what each message added to the context window, so the call
+  // tree and the flame graph read like an allocation profile: the stack is what
+  // produced the bytes and the weight is how many. Without this the panels are
+  // empty, since a conversation has no call stacks of its own.
+  const stackTable = { frame: [], prefix: [], category: [], subcategory: [], length: 0 };
   const frameTable = {
-    address: [-1],
-    inlineDepth: [0],
-    category: [null],
-    subcategory: [0],
-    func: [0],
-    nativeSymbol: [null],
-    innerWindowID: [0],
-    implementation: [null],
-    line: [null],
-    column: [null],
-    length: 1
+    address: [], inlineDepth: [], category: [], subcategory: [], func: [],
+    nativeSymbol: [], innerWindowID: [], implementation: [], line: [], column: [], length: 0
+  };
+  const funcTable = {
+    name: [], isJS: [], relevantForJS: [], resource: [], fileName: [],
+    lineNumber: [], columnNumber: [], length: 0
   };
 
-  // Create function table
-  const funcTable = {
-    name: [rootStrIdx],
-    isJS: [false],
-    relevantForJS: [false],
-    resource: [-1],
-    fileName: [null],
-    lineNumber: [null],
-    columnNumber: [null],
-    length: 1
+  const funcIndexes = new Map();
+  function addFunc(name) {
+    if (!funcIndexes.has(name)) {
+      funcIndexes.set(name, funcTable.length);
+      funcTable.name.push(addString(name));
+      funcTable.isJS.push(false);
+      funcTable.relevantForJS.push(false);
+      funcTable.resource.push(-1);
+      funcTable.fileName.push(null);
+      funcTable.lineNumber.push(null);
+      funcTable.columnNumber.push(null);
+      funcTable.length++;
+    }
+    return funcIndexes.get(name);
+  }
+
+  const frameIndexes = new Map();
+  function addFrame(name, category) {
+    const key = `${name}\u0000${category}`;
+    if (!frameIndexes.has(key)) {
+      frameIndexes.set(key, frameTable.length);
+      frameTable.address.push(-1);
+      frameTable.inlineDepth.push(0);
+      frameTable.category.push(category);
+      frameTable.subcategory.push(0);
+      frameTable.func.push(addFunc(name));
+      frameTable.nativeSymbol.push(null);
+      frameTable.innerWindowID.push(0);
+      frameTable.implementation.push(null);
+      frameTable.line.push(null);
+      frameTable.column.push(null);
+      frameTable.length++;
+    }
+    return frameIndexes.get(key);
+  }
+
+  const stackIndexes = new Map();
+  function addStack(frames, category) {
+    let prefix = null;
+    for (const name of frames) {
+      const frameIndex = addFrame(name, category);
+      const key = `${frameIndex}\u0000${prefix === null ? 'r' : prefix}`;
+      if (!stackIndexes.has(key)) {
+        stackIndexes.set(key, stackTable.length);
+        stackTable.frame.push(frameIndex);
+        stackTable.prefix.push(prefix);
+        stackTable.category.push(category);
+        stackTable.subcategory.push(0);
+        stackTable.length++;
+      }
+      prefix = stackIndexes.get(key);
+    }
+    return prefix;
+  }
+
+  // The root frame every stack hangs off, so the tree has a single top.
+  addFrame('(root)', 0);
+
+  const sampleStacks = [];
+  const sampleTimes = [];
+  const sampleWeights = [];
+
+  const toolUses = new Map();
+  messages.forEach((msg) => {
+    const content = msg.message?.content;
+    if (Array.isArray(content)) {
+      content.forEach((block) => {
+        if (block.type === 'tool_use') toolUses.set(block.id, block);
+      });
+    }
+  });
+
+  messages.forEach((msg) => {
+    const relativeTime = new Date(msg.timestamp).getTime() - startTime;
+    attributeEntry(msg, toolUses, (frames, category, bytes) => {
+      if (bytes <= 0) return;
+      const stackIndex = addStack(frames, sizeCategoryToTimeline(category));
+      if (stackIndex === null) return;
+      sampleStacks.push(stackIndex);
+      sampleTimes.push(relativeTime);
+      sampleWeights.push(bytes);
+    });
+  });
+
+  // Samples have to be in time order. Messages are not strictly ordered by
+  // timestamp within a thread, and one message contributes several samples, so
+  // they are sorted rather than assumed to come out in order.
+  const sampleOrder = sampleTimes
+    .map((time, index) => index)
+    .sort((a, b) => sampleTimes[a] - sampleTimes[b]);
+
+  const samples = {
+    length: sampleOrder.length,
+    stack: sampleOrder.map(index => sampleStacks[index]),
+    time: sampleOrder.map(index => sampleTimes[index]),
+    weight: sampleOrder.map(index => sampleWeights[index]),
+    weightType: 'bytes'
   };
 
   // Create resource table
@@ -1202,26 +1285,69 @@ async function openProfiler(serverUrl, profilerOrigin) {
   }
 }
 
+// What the size profile found, printed so the numbers are visible without
+// opening the front end.
+function reportSizeProfile(profile, sizeAt) {
+  console.log(`Created size profile with ${profile.threads.length} tracks ` +
+    `(context window at its ${sizeAt === 'last' ? 'last API call' : 'peak'})`);
+
+  for (const track of profile.tracks) {
+    const { calibration: fit, thread } = track;
+    const tokens = Math.round(thread.totalBytes / fit.bytesPerToken);
+    console.log(`  ${thread.name}`);
+    console.log(`    ${(thread.totalBytes / 1024).toFixed(0)}KB of context ` +
+      `≈ ${tokens.toLocaleString()} tokens, ` +
+      `API reported ${track.reportedTokens.toLocaleString()} ` +
+      `(call ${track.callIndex + 1}/${track.callCount})`);
+    if (fit.fitted) {
+      console.log(`    calibrated at ${fit.bytesPerToken.toFixed(2)} bytes/token ` +
+        `over ${fit.samples} calls, median error ` +
+        `${(100 * fit.medianError).toFixed(1)}%`);
+    }
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
   // Optional --profiler-origin, for pointing at a local front-end checkout
   // instead of the hosted profiler.
   let profilerOrigin = process.env.PROFILER_ORIGIN || DEFAULT_PROFILER_ORIGIN;
+  // --size builds a size profile of the context window instead of a timeline.
+  let sizeProfile = false;
+  let sizeAt = 'peak';
   const positional = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--profiler-origin') {
       profilerOrigin = args[++i];
     } else if (args[i].startsWith('--profiler-origin=')) {
       profilerOrigin = args[i].slice('--profiler-origin='.length);
+    } else if (args[i] === '--size') {
+      sizeProfile = true;
+    } else if (args[i] === '--at') {
+      sizeAt = args[++i];
+    } else if (args[i].startsWith('--at=')) {
+      sizeAt = args[i].slice('--at='.length);
     } else {
       positional.push(args[i]);
     }
   }
 
   if (positional.length === 0 || !profilerOrigin) {
-    console.error('Usage: claude-profiler <jsonl-file> [--profiler-origin <url>]');
+    console.error('Usage: claude-profiler <jsonl-file> [options]');
+    console.error('');
+    console.error('  --size                  Profile what fills the context window,');
+    console.error('                          instead of the session timeline.');
+    console.error('  --at peak|last          Which API call\'s window to profile,');
+    console.error('                          with --size. Defaults to peak.');
+    console.error('  --profiler-origin <url> Front end to open.');
+    console.error('');
     console.error('Example: claude-profiler ~/.claude/projects/my-project/my-session.jsonl');
+    process.exit(1);
+  }
+
+  if (sizeAt !== 'peak' && sizeAt !== 'last') {
+    console.error(`Error: --at expects "peak" or "last", got "${sizeAt}"`);
     process.exit(1);
   }
 
@@ -1246,12 +1372,22 @@ async function main() {
       console.log(`Found ${subagents.length} sub-agents (${entryCount} entries)`);
     }
 
-    const profile = createFirefoxProfile(jsonlData, subagents);
-    console.log(`Created Firefox profile with ${profile.threads.length} tracks`);
+    let profile;
+    if (sizeProfile) {
+      const { createSizeProfile } = require('./context-size.js');
+      profile = createSizeProfile(jsonlData, subagents, { at: sizeAt });
+      reportSizeProfile(profile, sizeAt);
+      // The reporting fields are not part of the profile format.
+      delete profile.tracks;
+      delete profile.totalBytes;
+    } else {
+      profile = createFirefoxProfile(jsonlData, subagents);
+      console.log(`Created Firefox profile with ${profile.threads.length} tracks`);
 
-    const cost = totalCost(conversationEntries(jsonlData)) +
-      subagents.reduce((sum, agent) => sum + totalCost(conversationEntries(agent.entries)), 0);
-    console.log(`Total cost: $${cost.toFixed(2)}`);
+      const cost = totalCost(conversationEntries(jsonlData)) +
+        subagents.reduce((sum, agent) => sum + totalCost(conversationEntries(agent.entries)), 0);
+      console.log(`Total cost: $${cost.toFixed(2)}`);
+    }
 
     const { server, serverUrl, shutdownRequested } = await startServer(profile, profilerOrigin);
     console.log(`Server started at ${serverUrl}`);
@@ -1288,7 +1424,9 @@ module.exports = {
   readJsonlFile,
   readSubagents,
   readSubagentsForSession,
-  createFirefoxProfile
+  createFirefoxProfile,
+  // Size profile of the context window, from context-size.js.
+  createSizeProfile: (...args) => require('./context-size.js').createSizeProfile(...args)
 };
 
 if (require.main === module) {

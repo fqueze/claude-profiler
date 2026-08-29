@@ -7,12 +7,21 @@
     "claude-profiler": "./index.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test-shell-parse.js && node test-size-profile.js"
   },
-  "keywords": ["profiler", "claude", "firefox"],
+  "keywords": [
+    "profiler",
+    "claude",
+    "firefox"
+  ],
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "open": "^10.0.0"
-  }
+  "files": [
+    "index.js",
+    "context-size.js",
+    "size-profile.js",
+    "shell-parse.js",
+    "JSONL_FORMAT.md",
+    "README.md"
+  ]
 }

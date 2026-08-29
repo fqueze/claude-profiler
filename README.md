@@ -55,9 +55,11 @@ claude-profiler "$(ls -t ~/.claude/projects/"${PWD//\//-}"/*.jsonl | head -1)"
 
 ### Options
 
-`--profiler-origin <url>` sets the front end to open, and the origin allowed to
-fetch the profile. Defaults to `https://profiler.firefox.com`, or
-`$PROFILER_ORIGIN` if set.
+| | |
+|---|---|
+| `--size` | Profile what fills the context window, instead of the session timeline. |
+| `--at peak\|last` | Which API call's window to profile, with `--size`. Defaults to `peak`. |
+| `--profiler-origin <url>` | Front end to open, and the origin allowed to fetch the profile. Defaults to `https://profiler.firefox.com`, or `$PROFILER_ORIGIN` if set. |
 
 The profile is served with an `Access-Control-Allow-Origin` header for that
 origin, since the front end fetches it from the browser.
@@ -72,6 +74,68 @@ claude-profiler <jsonl-file> --profiler-origin http://localhost:4242
 
 A browser or extension that blocks page requests to loopback addresses will
 break the hosted flow; a front end on localhost is not subject to that.
+
+## Profiling what filled the context window
+
+`--size` builds a size profile instead of a timeline: bytes go on the time axis
+and in the sample weights, the same shape as an allocation profile, so the
+**flame graph** and the call tree answer "what is taking up the window".
+
+```sh
+claude-profiler <jsonl-file> --size
+```
+
+The stack is what produced the bytes rather than a code path, and a Bash call is
+broken down into the commands inside it:
+
+```
+Bash (output) / profiler-cli thread markers / head -30
+Bash (output) / for loop / sed -n 20430,20500p
+Bash (call)   / cat
+Read (output) / browser/components/sidebar/sidebar-main.mjs
+```
+
+One call often runs several commands, so a single `Bash` frame would say
+nothing. The agent's habit of writing `echo "=== something ==="` between
+commands is what makes the split possible: that text is the only marker that
+survives into the output, so bytes printed between two markers are attributed to
+the commands in between. Pipeline stages get their own frame, since `| head -30`
+is the reason the output is the size it is. Commands inside a loop aggregate
+under the loop, whose `echo` repeats once per iteration.
+
+`--at last` profiles the window at the session's final API call instead of at
+its peak. Sub-agents each get their own track, as in the timeline profile.
+
+### Bytes and tokens
+
+Sample weights are bytes, counted exactly. Tokens are reported alongside them,
+derived by fitting `tokens ≈ overhead + bytes / bytesPerToken` against the token
+counts the API itself reported for every call in the session:
+
+```
+796KB of context ≈ 349,201 tokens, API reported 394,696 (call 375/375)
+calibrated at 2.34 bytes/token over 374 calls, median error 0.6%
+```
+
+There is no offline tokenizer for these models — the only exact count is the
+API's own `count_tokens`, which is a network call per request — so calibrating
+against the counts already in the log is both dependency-free and
+self-correcting. It also beats a fixed rule of thumb: tool output is dense log
+and JSON text that runs about 2.3 bytes per token rather than the ~4 of prose.
+
+The fit's intercept is the part of the window that never appears in the log at
+all — the system prompt, the tool schemas and CLAUDE.md — which is why the
+profile has a `System prompt + tool schemas (not logged)` frame. Without it the
+tree would silently be missing about 30k tokens.
+
+### How the window is reconstructed
+
+The window is not the whole log. Content leaves it when the conversation is
+compacted, and each sub-agent has a window of its own, so accumulating every
+logged byte overstates a long session's window by more than 2x. What is resident
+at a given API call is the chain of messages leading to it, which the log records
+through `parentUuid`; the profile walks that chain back from a call and stops at
+the most recent `compact_boundary` entry.
 
 ## What the profile contains
 
@@ -92,6 +156,11 @@ Markers on each track:
 | Tool name | One interval per call, from request to result, with the call detail, output size and status. Failed and interrupted calls are red. |
 | `Subagent` | On the spawning track, spanning the lifetime of the sub-agent's own track. |
 
+Samples carry what each message added to the window — stack is what produced
+the bytes, weight is how many — so the call tree and the flame graph work on the
+timeline profile too, as they would for an allocation profile. Selecting a range
+shows what filled the window during it.
+
 Counter graphs, sampled at every API call: `Context Size`, `Input Tokens`,
 `Output Tokens`, `Cache Read Tokens`, `Cache Creation Tokens`, `Cost ($)`,
 `Agent Cost ($)` — plus `Total Cost ($)` on the main track, sampled across every
@@ -108,11 +177,15 @@ const {
   readJsonlFile,
   readSubagents,
   readSubagentsForSession,
-  createFirefoxProfile
+  createFirefoxProfile,
+  createSizeProfile
 } = require('claude-profiler');
 
 const entries = readJsonlFile(jsonlPath);
-const profile = createFirefoxProfile(entries, readSubagents(jsonlPath));
+const subagents = readSubagents(jsonlPath);
+
+const timeline = createFirefoxProfile(entries, subagents);
+const size = createSizeProfile(entries, subagents, { at: 'peak' });
 ```
 
 `createFirefoxProfile(entries, subagents)` returns a
@@ -131,6 +204,14 @@ to add a profiler button to each session row.
 
 ## Files
 
-- `index.js` — the CLI and the profile builder.
+- `index.js` — the CLI and the timeline profile builder.
+- `context-size.js` — context window reconstruction, calibration and the size
+  profile.
+- `size-profile.js` — attribution of bytes to stacks, and the profile tables.
+- `shell-parse.js` — enough shell parsing to split a Bash call into the commands
+  that produced its output.
 - [`JSONL_FORMAT.md`](JSONL_FORMAT.md) — the session log format: entry types,
   usage objects, sub-agent layout, cost formula and known limitations.
+
+`npm test` covers the shell parsing, the output attribution, the window
+reconstruction and the calibration.

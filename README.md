@@ -106,31 +106,6 @@ under the loop, whose `echo` repeats once per iteration.
 `--at last` profiles the window at the session's final API call instead of at
 its peak. Sub-agents each get their own track, as in the timeline profile.
 
-### Reading the output that filled the window
-
-Double-clicking a frame in the call tree or the flame graph opens the source
-view on the session transcript, scrolled to the output that frame is about — so
-the question "was that command's output worth its bytes?" is one double-click
-from the frame that raised it. The gutter shows how many bytes each line put in
-the window, since line hits are the sample weights, so a long block of
-near-identical lines reads as exactly that.
-
-Each track's transcript covers just what was resident in that window, with each
-tool result preceded by the command that produced it:
-
-```
-──── Bash output 2026-08-28 22:14:03 — 10.2 KB ─────────────────────────
-$ cd /Users/me/firefox/artifacts; mkdir -p sbfail && mv WqG3Pv_* sbfail/ …
-18987:[task 2026-08-28T19:37:10.760+00:00] INFO - TEST-START | browser/…
-18996:[task 2026-08-28T19:37:13.122+00:00] INFO - TEST-PASS | browser/…
-```
-
-The transcripts are embedded in the profile itself, in the sources table's
-`content` column, so the source view needs no symbol server and a saved or
-shared profile stays readable on its own. This is what fixes the profile at
-format version 64: earlier versions have their sources table rebuilt by the
-front end's upgraders, which would drop the embedded text.
-
 ### Bytes and tokens
 
 Sample weights are bytes, counted exactly. Tokens are reported alongside them,
@@ -161,6 +136,40 @@ logged byte overstates a long session's window by more than 2x. What is resident
 at a given API call is the chain of messages leading to it, which the log records
 through `parentUuid`; the profile walks that chain back from a call and stops at
 the most recent `compact_boundary` entry.
+
+## Reading the output in the source view
+
+Both profiles carry the session transcript, so double-clicking a frame in the
+call tree or the flame graph opens the source view scrolled to the output that
+frame is about — the question "was that command's output worth its bytes?" is
+one double-click from the frame that raised it. The gutter shows how many bytes
+each line contributed, since line hits are the sample weights, so a long run of
+near-identical lines reads as exactly that.
+
+A tool call is written the way a terminal would show it: the command, then what
+it printed. There is nothing in between to skip past, because the view scrolls
+to the right line by itself.
+
+```
+21:16:53 $ cd /Users/me/firefox/artifacts; mkdir -p sbfail && mv WqG3Pv_* sbfail/ …
+  (10.2 KB, 3.4 s)
+18987:[task 2026-08-28T19:37:10.760+00:00] INFO - TEST-START | browser/…
+18996:[task 2026-08-28T19:37:13.122+00:00] INFO - TEST-PASS | browser/…
+```
+
+The size note appears once the output is worth wondering about, from 4 KB up.
+Its duration is the gap between the request and its result: both log entries are
+written when the message is logged, so neither timestamp alone says how long a
+command took.
+
+The `--size` transcript covers only what was resident in the profiled window;
+the timeline's covers the whole track.
+
+Transcripts are embedded in the profile itself, in the sources table's `content`
+column, so the source view needs no symbol server and a saved or shared profile
+stays readable on its own. This is what fixes both profiles at format version
+64: earlier versions have that table rebuilt by the front end's upgraders, which
+would drop the embedded text.
 
 ## What the profile contains
 

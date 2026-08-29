@@ -205,15 +205,29 @@ check('transcript keys the user prompt', at(rendered.lineFor.get('u1')),
   'please list the files');
 check('transcript keys the assistant text', at(rendered.lineFor.get('u2')),
   'Listing them.');
+// A Bash call is written as a shell prompt line, timestamped, so it reads as
+// the thing that produced the output below it.
 check('transcript keys the tool call', at(rendered.lineFor.get('tu1:call')),
-  'echo "=== hello ==="; ls');
+  '21:08:25 $ echo "=== hello ==="; ls');
 check('transcript keys the tool output', at(rendered.lineFor.get('tu1:output')),
   '=== hello ===');
 
-// The command is shown above its output, so the view has context for the bytes.
-check('output is preceded by its command',
+// The output follows its command directly, with nothing in between: a small
+// result needs no size note, and there is no separator to skip past.
+check('output follows the command line directly',
   at(rendered.lineFor.get('tu1:output') - 1),
-  '$ echo "=== hello ==="; ls');
+  '21:08:25 $ echo "=== hello ==="; ls');
+
+// A call's duration is the gap between the request and its result. Both entries
+// are stamped when they are logged, so neither alone says how long it took.
+const { timeToolCalls, formatDuration } = require('./transcript.js');
+const timed = timeToolCalls(sessionEntries);
+check('call duration comes from the request/result pair',
+  timed.get('tu1').end - timed.get('tu1').start,
+  1000);
+check('durations read in seconds past a second', formatDuration(11500), '11.5 s');
+check('durations read in ms below a second', formatDuration(650), '650 ms');
+check('durations read in minutes past a minute', formatDuration(95000), '1m 35s');
 
 // Lines are 1-based, as the source view expects.
 check('lines are 1-based', Math.min(...rendered.lineFor.values()) >= 1, true);

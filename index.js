@@ -8,6 +8,7 @@ const { spawn } = require('child_process');
 // Attribution of a message's bytes, shared with the size profile so both tools
 // build the same stacks.
 const { attributeEntry } = require('./context-size.js');
+const { renderTranscript } = require('./transcript.js');
 
 // Prices per million tokens, from
 // https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-08-09).
@@ -339,6 +340,124 @@ function findAgentToolUses(messages) {
   return toolUses;
 }
 
+// The tables a v64 profile shares across every thread, plus the sources table
+// each track's transcript is embedded in.
+function createTimelineShared() {
+  const shared = {
+    strings: [],
+    stringMap: new Map(),
+    funcIndexes: new Map(),
+    frameIndexes: new Map(),
+    stackIndexes: new Map(),
+    stackTable: { frame: [], prefix: [], length: 0 },
+    frameTable: {
+      address: [], inlineDepth: [], category: [], subcategory: [], func: [],
+      nativeSymbol: [], innerWindowID: [], originalLocation: [], line: [],
+      column: [], length: 0
+    },
+    funcTable: {
+      name: [], isJS: [], relevantForJS: [], resource: [], source: [],
+      lineNumber: [], columnNumber: [], originalLocation: [], length: 0
+    },
+    resourceTable: { lib: [], name: [], host: [], type: [], length: 0 },
+    sources: { length: 0, id: [], filename: [], startLine: [], startColumn: [], sourceMapURL: [], content: [] },
+    resourceBySource: new Map()
+  };
+
+  shared.intern = (text) => {
+    if (!shared.stringMap.has(text)) {
+      shared.stringMap.set(text, shared.strings.length);
+      shared.strings.push(text);
+    }
+    return shared.stringMap.get(text);
+  };
+
+  // A source file whose text travels inside the profile, so the source view
+  // needs nothing from the network and a saved profile stays readable.
+  shared.registerSource = (fileName, content, resourceName) => {
+    const index = shared.sources.length;
+    shared.sources.id.push(null);
+    shared.sources.filename.push(shared.intern(fileName));
+    shared.sources.startLine.push(1);
+    shared.sources.startColumn.push(1);
+    shared.sources.sourceMapURL.push(null);
+    shared.sources.content.push(content);
+    shared.sources.length++;
+
+    shared.resourceBySource.set(index, shared.resourceTable.length);
+    shared.resourceTable.lib.push(null);
+    shared.resourceTable.name.push(shared.intern(resourceName || fileName));
+    shared.resourceTable.host.push(null);
+    // ResourceType.Url: the "file" is a document, not a library.
+    shared.resourceTable.type.push(5);
+    shared.resourceTable.length++;
+
+    return index;
+  };
+
+  shared.resourceForSource = (sourceIndex) =>
+    shared.resourceBySource.has(sourceIndex)
+      ? shared.resourceBySource.get(sourceIndex)
+      : -1;
+
+  return shared;
+}
+
+// The shared half of a v64 profile, once every track has interned into it.
+function buildTimelineShared(shared) {
+  return {
+    stringArray: shared.strings,
+    stackTable: {
+      length: shared.stackTable.length,
+      prefix: shared.stackTable.prefix,
+      frame: shared.stackTable.frame
+    },
+    frameTable: {
+      length: shared.frameTable.length,
+      address: shared.frameTable.address,
+      inlineDepth: shared.frameTable.inlineDepth,
+      category: shared.frameTable.category,
+      subcategory: shared.frameTable.subcategory,
+      func: shared.frameTable.func,
+      nativeSymbol: shared.frameTable.nativeSymbol,
+      innerWindowID: shared.frameTable.innerWindowID,
+      originalLocation: shared.frameTable.originalLocation,
+      line: shared.frameTable.line,
+      column: shared.frameTable.column
+    },
+    funcTable: {
+      length: shared.funcTable.length,
+      name: shared.funcTable.name,
+      isJS: shared.funcTable.isJS,
+      relevantForJS: shared.funcTable.relevantForJS,
+      resource: shared.funcTable.resource,
+      source: shared.funcTable.source,
+      lineNumber: shared.funcTable.lineNumber,
+      columnNumber: shared.funcTable.columnNumber,
+      originalLocation: shared.funcTable.originalLocation
+    },
+    resourceTable: {
+      length: shared.resourceTable.length,
+      lib: shared.resourceTable.lib,
+      name: shared.resourceTable.name,
+      host: shared.resourceTable.host,
+      type: shared.resourceTable.type
+    },
+    nativeSymbols: { length: 0, address: [], functionSize: [], libIndex: [], name: [] },
+    sources: shared.sources,
+    sourceLocationTable: { source: [], line: [], column: [], length: 0 }
+  };
+}
+
+// A filename for a track's transcript, shown in the source view's header.
+function sourceSlug(label) {
+  const cleaned = String(label || 'session')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return (cleaned || 'session').slice(0, 60);
+}
+
 // The size profile has its own category list; the timeline profile's is about
 // what happened rather than where bytes came from, so they are mapped over.
 function sizeCategoryToTimeline(category) {
@@ -365,10 +484,15 @@ function buildThread({
   tid,
   spans,
   registerTime,
-  unregisterTime
+  unregisterTime,
+  shared,
+  transcript,
+  sourceFile
 }) {
-  const stringTable = new Map();
-  const strings = [];
+  // The string, stack, frame and func tables are shared across every thread
+  // from format v60 on, so this thread interns into the profile's set.
+  const strings = shared.strings;
+  const stringTable = shared.stringMap;
 
   function addString(str) {
     if (!stringTable.has(str)) {
@@ -377,6 +501,11 @@ function buildThread({
     }
     return stringTable.get(str);
   }
+
+  // This track's transcript, embedded so the source view can show it without
+  // fetching anything. Registered before any func is created, since a func
+  // records which source it belongs to.
+  const sourceIndex = shared.registerSource(sourceFile, transcript.text, processName);
 
   const markers = {
     data: [],
@@ -600,35 +729,29 @@ function buildThread({
   // tree and the flame graph read like an allocation profile: the stack is what
   // produced the bytes and the weight is how many. Without this the panels are
   // empty, since a conversation has no call stacks of its own.
-  const stackTable = { frame: [], prefix: [], category: [], subcategory: [], length: 0 };
-  const frameTable = {
-    address: [], inlineDepth: [], category: [], subcategory: [], func: [],
-    nativeSymbol: [], innerWindowID: [], implementation: [], line: [], column: [], length: 0
-  };
-  const funcTable = {
-    name: [], isJS: [], relevantForJS: [], resource: [], fileName: [],
-    lineNumber: [], columnNumber: [], length: 0
-  };
+  const { stackTable, frameTable, funcTable } = shared;
 
-  const funcIndexes = new Map();
+  const funcIndexes = shared.funcIndexes;
   function addFunc(name) {
-    if (!funcIndexes.has(name)) {
-      funcIndexes.set(name, funcTable.length);
+    const key = `${name}\u0000${sourceIndex}`;
+    if (!funcIndexes.has(key)) {
+      funcIndexes.set(key, funcTable.length);
       funcTable.name.push(addString(name));
       funcTable.isJS.push(false);
       funcTable.relevantForJS.push(false);
-      funcTable.resource.push(-1);
-      funcTable.fileName.push(null);
+      funcTable.resource.push(shared.resourceForSource(sourceIndex));
+      funcTable.source.push(sourceIndex);
       funcTable.lineNumber.push(null);
       funcTable.columnNumber.push(null);
+      funcTable.originalLocation.push(null);
       funcTable.length++;
     }
-    return funcIndexes.get(name);
+    return funcIndexes.get(key);
   }
 
-  const frameIndexes = new Map();
-  function addFrame(name, category) {
-    const key = `${name}\u0000${category}`;
+  const frameIndexes = shared.frameIndexes;
+  function addFrame(name, category, line) {
+    const key = `${name}\u0000${category}\u0000${sourceIndex}\u0000${line === undefined ? 'x' : line}`;
     if (!frameIndexes.has(key)) {
       frameIndexes.set(key, frameTable.length);
       frameTable.address.push(-1);
@@ -637,36 +760,37 @@ function buildThread({
       frameTable.subcategory.push(0);
       frameTable.func.push(addFunc(name));
       frameTable.nativeSymbol.push(null);
-      frameTable.innerWindowID.push(0);
-      frameTable.implementation.push(null);
-      frameTable.line.push(null);
+      frameTable.innerWindowID.push(null);
+      frameTable.originalLocation.push(null);
+      // Where this frame's content sits in the transcript, so double-clicking it
+      // scrolls the source view there.
+      frameTable.line.push(line === undefined ? null : line);
       frameTable.column.push(null);
       frameTable.length++;
     }
     return frameIndexes.get(key);
   }
 
-  const stackIndexes = new Map();
-  function addStack(frames, category) {
+  const stackIndexes = shared.stackIndexes;
+  // Only the leaf carries a line: the ancestors are groupings that no single
+  // place in the transcript corresponds to.
+  function addStack(frames, category, line) {
     let prefix = null;
-    for (const name of frames) {
-      const frameIndex = addFrame(name, category);
+    frames.forEach((name, index) => {
+      const isLeaf = index === frames.length - 1;
+      const frameIndex = addFrame(name, category, isLeaf ? line : undefined);
       const key = `${frameIndex}\u0000${prefix === null ? 'r' : prefix}`;
       if (!stackIndexes.has(key)) {
         stackIndexes.set(key, stackTable.length);
         stackTable.frame.push(frameIndex);
         stackTable.prefix.push(prefix);
-        stackTable.category.push(category);
-        stackTable.subcategory.push(0);
         stackTable.length++;
       }
       prefix = stackIndexes.get(key);
-    }
+    });
     return prefix;
   }
 
-  // The root frame every stack hangs off, so the tree has a single top.
-  addFrame('(root)', 0);
 
   const sampleStacks = [];
   const sampleTimes = [];
@@ -684,14 +808,14 @@ function buildThread({
 
   messages.forEach((msg) => {
     const relativeTime = new Date(msg.timestamp).getTime() - startTime;
-    attributeEntry(msg, toolUses, (frames, category, bytes) => {
+    attributeEntry(msg, toolUses, (frames, category, bytes, line) => {
       if (bytes <= 0) return;
-      const stackIndex = addStack(frames, sizeCategoryToTimeline(category));
+      const stackIndex = addStack(frames, sizeCategoryToTimeline(category), line);
       if (stackIndex === null) return;
       sampleStacks.push(stackIndex);
       sampleTimes.push(relativeTime);
       sampleWeights.push(bytes);
-    });
+    }, transcript.lineFor);
   });
 
   // Samples have to be in time order. Messages are not strictly ordered by
@@ -710,14 +834,6 @@ function buildThread({
   };
 
   // Create resource table
-  const resourceTable = {
-    lib: [],
-    name: [],
-    host: [],
-    type: [],
-    length: 0
-  };
-
   return {
     processType: 'default',
     processName,
@@ -732,19 +848,8 @@ function buildThread({
     pid,
     tid,
     samples,
-    markers,
-    stackTable,
-    frameTable,
-    stringArray: strings,
-    funcTable,
-    resourceTable,
-    nativeSymbols: {
-      address: [],
-      functionSize: [],
-      libIndex: [],
-      name: [],
-      length: 0
-    }
+    markers
+    // The stack, frame, func and resource tables are on profile.shared.
   };
 }
 
@@ -862,22 +967,55 @@ function createFirefoxProfile(jsonlData, subagents) {
     }
   });
 
-  const threads = tracks.map((track, index) => buildThread({
-    entries: track.entries,
-    messages: track.messages,
-    apiCalls: track.apiCalls,
-    totalCostPoints: track.id === 'main' ? totalCostPoints : null,
-    startTime,
-    threadName: track.threadName,
-    processName: track.processName,
-    // Numeric, and increasing with start time: the profiler orders process
-    // tracks by pid, and string pids would sort "10" before "2".
-    pid: index,
-    tid: index,
-    spans: track.spans,
-    registerTime: track.start - startTime,
-    unregisterTime: track.end - startTime
-  }));
+  // One set of tables for the whole profile, and one embedded transcript per
+  // track, so the source view shows the conversation for the frame that was
+  // double-clicked.
+  const shared = createTimelineShared();
+  const usedNames = new Map();
+
+  const threads = tracks.map((track, index) => {
+    const toolUses = new Map();
+    track.messages.forEach((msg) => {
+      const content = msg.message?.content;
+      if (Array.isArray(content)) {
+        content.forEach((block) => {
+          if (block.type === 'tool_use') toolUses.set(block.id, block);
+        });
+      }
+    });
+
+    const transcript = renderTranscript(track.messages, toolUses, {
+      title: track.threadName,
+      subtitle: track.processName
+    });
+
+    const base = `${sourceSlug(track.threadName)}.transcript.txt`;
+    const seen = usedNames.get(base) || 0;
+    usedNames.set(base, seen + 1);
+    const sourceFile = seen === 0
+      ? base
+      : `${sourceSlug(track.threadName)}-${seen + 1}.transcript.txt`;
+
+    return buildThread({
+      entries: track.entries,
+      messages: track.messages,
+      apiCalls: track.apiCalls,
+      totalCostPoints: track.id === 'main' ? totalCostPoints : null,
+      startTime,
+      threadName: track.threadName,
+      processName: track.processName,
+      // Numeric, and increasing with start time: the profiler orders process
+      // tracks by pid, and string pids would sort "10" before "2".
+      pid: index,
+      tid: index,
+      spans: track.spans,
+      registerTime: track.start - startTime,
+      unregisterTime: track.end - startTime,
+      shared,
+      transcript,
+      sourceFile
+    });
+  });
 
   // Create categories
   const categories = [
@@ -1218,8 +1356,12 @@ function createFirefoxProfile(jsonlData, subagents) {
       processType: 0,
       product: 'Claude Code',
       stackwalk: 0,
-      version: 27,
-      preprocessedProfileVersion: 47,
+      // The processed-format version, which is what the front end upgrades
+      // from. v64 is the first one whose sources table has a `content` column,
+      // where each track's transcript is embedded; older versions have that
+      // table rebuilt by the upgraders, which drops the text.
+      version: 64,
+      preprocessedProfileVersion: 64,
       symbolicationNotSupported: true,
       interval: 1,
       startTime,
@@ -1230,6 +1372,8 @@ function createFirefoxProfile(jsonlData, subagents) {
     },
     libs: [],
     threads,
+    // Built after every track has interned into it.
+    shared: buildTimelineShared(shared),
     counters: []
   };
 

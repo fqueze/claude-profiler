@@ -310,7 +310,9 @@ function describeStage(words) {
     .filter(word => word.startsWith('-') && word !== '-' && word.length <= 12)
     .slice(0, 2);
 
-  // The first argument that is not a flag or a subcommand, shortened.
+  // The arguments that are neither flags, subcommands nor assignments. `detail`
+  // is the first of them, which is what a name aggregating several calls can
+  // show; `args` keeps all of them, for naming one specific call.
   const args = rest.filter(word =>
     !word.startsWith('-') &&
     !word.startsWith('<<') &&
@@ -325,6 +327,7 @@ function describeStage(words) {
     subcommands,
     flags,
     detail,
+    args,
     isFilter: FILTERS.has(name),
     isSetup: SETUP.has(name) || NON_PRODUCERS.has(name)
   };

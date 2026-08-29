@@ -294,8 +294,13 @@ const funcsNamed = (wanted) => {
   return found.size;
 };
 check('the repeated command shares one func', funcsNamed('sed -n'), 1);
-check('each occurrence gets its own leaf',
-  names.filter(name => name.startsWith('line ')).length >= 2, true);
+// A leaf names the one call it stands for, operands included, so it says what
+// was read. `line 620` is only the fallback for a chunk that cannot be pinned on
+// a single command.
+check('each occurrence gets a leaf naming its invocation', [
+  names.includes('sed -n 1,5p a'),
+  names.includes('sed -n 90,99p b')
+], [true, true]);
 
 // Marker schemas must use `fields`: the rename from `data` happened in format
 // v55, and these profiles declare v64, so no upgrader will fix it. A schema

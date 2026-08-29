@@ -732,8 +732,11 @@ function buildThread({
   const { stackTable, frameTable, funcTable } = shared;
 
   const funcIndexes = shared.funcIndexes;
-  function addFunc(name) {
-    const key = `${name}\u0000${sourceIndex}`;
+  // The line is part of a func's identity, not of its name: two calls can be
+  // spelled the same and sit at different places in the transcript, and sharing
+  // a func would make both scroll to whichever is heavier.
+  function addFunc(name, line) {
+    const key = `${name}\u0000${sourceIndex}\u0000${line === undefined ? 'x' : line}`;
     if (!funcIndexes.has(key)) {
       funcIndexes.set(key, funcTable.length);
       funcTable.name.push(addString(name));
@@ -758,7 +761,7 @@ function buildThread({
       frameTable.inlineDepth.push(0);
       frameTable.category.push(category);
       frameTable.subcategory.push(0);
-      frameTable.func.push(addFunc(name));
+      frameTable.func.push(addFunc(name, line));
       frameTable.nativeSymbol.push(null);
       frameTable.innerWindowID.push(null);
       frameTable.originalLocation.push(null);
@@ -777,8 +780,8 @@ function buildThread({
   // scroll somewhere unrelated to the box that was clicked. The location gets a
   // leaf frame of its own below the frames that aggregate by name: parents stay
   // merged, the leaf scrolls exactly.
-  function addStack(frames, category, line) {
-    const path = line === undefined ? frames : [...frames, `line ${line}`];
+  function addStack(frames, category, line, leafLabel) {
+    const path = line === undefined ? frames : [...frames, leafLabel || `line ${line}`];
 
     let prefix = null;
     path.forEach((name, index) => {
@@ -813,9 +816,9 @@ function buildThread({
 
   messages.forEach((msg) => {
     const relativeTime = new Date(msg.timestamp).getTime() - startTime;
-    attributeEntry(msg, toolUses, (frames, category, bytes, line) => {
+    attributeEntry(msg, toolUses, (frames, category, bytes, line, leafLabel) => {
       if (bytes <= 0) return;
-      const stackIndex = addStack(frames, sizeCategoryToTimeline(category), line);
+      const stackIndex = addStack(frames, sizeCategoryToTimeline(category), line, leafLabel);
       if (stackIndex === null) return;
       sampleStacks.push(stackIndex);
       sampleTimes.push(relativeTime);

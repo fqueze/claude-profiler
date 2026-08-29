@@ -143,6 +143,34 @@ function splitOutputByEchoes(output, segments) {
   return chunks;
 }
 
+// The label for the leaf frame of a chunk of Bash output: the full invocation
+// of the command that produced it, so the leaf says what was read rather than
+// just where it landed in the transcript. Null when the chunk cannot be pinned
+// on one command, since then there is no single invocation to name.
+function bashLeafLabel(chunk) {
+  const producers = (chunk.segments || []).filter(s => s.producer && !s.producer.isSetup);
+  if (producers.length === 0) {
+    const only = (chunk.segments || [])[0];
+    return only && only.isEcho ? describeInvocation(only.pipeline[0]) : null;
+  }
+
+  const body = producers.filter(s => !LOOPS.has(s.producer.name));
+  const candidates = body.length > 0 ? body : producers;
+  const names = [...new Set(candidates.map(s => describeInvocation(s.producer)))];
+  if (names.length === 1) {
+    return names[0];
+  }
+
+  // Several commands shared the chunk with no marker between them, so which of
+  // them printed what is not knowable. Naming them all is still better than a
+  // bare line number, as long as it does not read as one command: the leading
+  // `+` marks it as a group.
+  const listed = names.slice(0, 3).join(' + ');
+  const rest = names.length > 3 ? ` + ${names.length - 3} more` : '';
+  const label = `+ ${listed}${rest}`;
+  return label.length > 140 ? `${label.slice(0, 140)}…` : label;
+}
+
 // Builds the stack for a chunk of Bash output: the producing command, then the
 // filters that trimmed it, so `| head -30` shows up as the reason the output is
 // the size it is.
@@ -225,6 +253,27 @@ function describeFrame(stage) {
   return parts.join(' ');
 }
 
+// The name for a frame that stands for one invocation rather than for every call
+// of a command: the whole thing, operands included, so it says what was actually
+// read. Aggregating frames deliberately leave these out — an operand differs at
+// every call site and would stop them merging — but a leaf is that one call.
+function describeInvocation(stage) {
+  const parts = [
+    stage.name,
+    ...(stage.subcommands || []),
+    ...stage.flags,
+    ...(stage.args || []).map(quoteIfNeeded)
+  ];
+  const text = parts.join(' ');
+  return text.length > 110 ? `${text.slice(0, 110)}…` : text;
+}
+
+// Arguments are shown as they would be typed, so a line range or a pattern with
+// spaces reads as one argument rather than running into the next.
+function quoteIfNeeded(arg) {
+  return /[\s'"|&;<>()$`\\*?\[\]]/.test(arg) ? `'${arg.replace(/'/g, "'\\''")}'` : arg;
+}
+
 // Everything the profile needs to know about one contribution of bytes.
 // The tables a whole profile shares: from v60 on the stack, frame, func and
 // resource tables live on profile.shared rather than per thread, so every track
@@ -270,9 +319,9 @@ class SizeProfileBuilder {
   // A func is one name in one source file. Frames sharing a name but sitting at
   // different lines of the transcript are separate frames, since the line is per
   // frame, but they share a func so the call tree aggregates them by name.
-  func(name, sourceIndex) {
+  func(name, sourceIndex, line) {
     const nameIndex = this.intern(name);
-    const key = `${nameIndex}:${sourceIndex === undefined ? 'x' : sourceIndex}`;
+    const key = `${nameIndex}:${sourceIndex === undefined ? 'x' : sourceIndex}:${line === undefined ? 'x' : line}`;
     const { funcMap, funcTable } = this.shared;
     if (!funcMap.has(key)) {
       funcMap.set(key, funcTable.name.length);
@@ -284,9 +333,9 @@ class SizeProfileBuilder {
   }
 
   frame(name, category, line) {
-    // Only a leaf carries a line, and a leaf's name already encodes it, so the
-    // func is unique per location there and shared per name above.
-    const funcIndex = this.func(name, this.sourceIndex);
+    // Only a leaf carries a line, so a leaf gets a func of its own per location
+    // while the aggregating frames above share one func per name.
+    const funcIndex = this.func(name, this.sourceIndex, line);
     const key = `${funcIndex}:${category}:${line === undefined ? 'x' : line}`;
     const { frameMap, frameTable } = this.shared;
     if (!frameMap.has(key)) {
@@ -303,10 +352,10 @@ class SizeProfileBuilder {
   // places would scroll somewhere unrelated to the box that was clicked. The
   // location therefore gets a leaf frame of its own, below the frames that
   // aggregate by name: the parents stay merged, the leaf scrolls exactly.
-  stack(frames, category, line) {
+  stack(frames, category, line, leafLabel) {
     const path = line === undefined
       ? frames
-      : [...frames, `line ${line}`];
+      : [...frames, leafLabel || `line ${line}`];
 
     let prefix = null;
     path.forEach((name, index) => {
@@ -327,9 +376,9 @@ class SizeProfileBuilder {
   // Adds bytes at a stack. Contributions to the same stack are summed, so the
   // sample count stays proportional to the number of distinct stacks rather
   // than to the number of messages.
-  add(frames, category, bytes, line) {
+  add(frames, category, bytes, line, leafLabel) {
     if (bytes <= 0 || frames.length === 0) return;
-    const stackIndex = this.stack(frames, category, line);
+    const stackIndex = this.stack(frames, category, line, leafLabel);
     if (stackIndex === null) return;
     this.weights.set(stackIndex, (this.weights.get(stackIndex) || 0) + bytes);
   }
@@ -527,6 +576,8 @@ module.exports = {
   resultText,
   echoOutput,
   describeFrame,
+  describeInvocation,
+  bashLeafLabel,
   summarizeNames,
   createSharedTables,
   buildSharedData

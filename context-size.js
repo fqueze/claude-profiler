@@ -21,6 +21,8 @@ const {
   resultText,
   describeFrame,
   summarizeNames,
+  bashLeafLabel,
+  describeInvocation,
   createSharedTables,
   buildSharedData
 } = require('./size-profile.js');
@@ -118,7 +120,7 @@ function attributeEntry(entry, toolUses, add, lineFor) {
   if (typeof content === 'string') {
     const category = role === 'user' ? CATEGORY['User text'] : CATEGORY['Assistant text'];
     add([role === 'user' ? 'User prompt' : 'Assistant text'], category,
-      byteLength(content), lineOf(entry.uuid));
+      byteLength(content), lineOf(entry.uuid), firstWords(content));
     return;
   }
 
@@ -128,7 +130,7 @@ function attributeEntry(entry, toolUses, add, lineFor) {
     if (block.type === 'text') {
       const category = role === 'user' ? CATEGORY['User text'] : CATEGORY['Assistant text'];
       add([role === 'user' ? 'User prompt' : 'Assistant text'], category,
-        byteLength(block.text), lineOf(entry.uuid));
+        byteLength(block.text), lineOf(entry.uuid), firstWords(block.text));
       continue;
     }
 
@@ -142,6 +144,7 @@ function attributeEntry(entry, toolUses, add, lineFor) {
       const bytes = byteLength(JSON.stringify(block.input || {}));
       const frames = [`${block.name} (call)`];
       const subject = toolSubject(block.name, block.input);
+      let leafLabel = null;
 
       if (block.name === 'Bash') {
         // The command text is context too, and a heredoc writing a file makes
@@ -155,11 +158,28 @@ function attributeEntry(entry, toolUses, add, lineFor) {
             .map(s => describeFrame(s.producer))
         )];
         if (producers.length > 0) frames.push(summarizeNames(producers));
+
+        const invocations = [...new Set(segments
+          .filter(s => s.producer && !s.producer.isSetup && !s.isEcho)
+          .map(s => describeInvocation(s.producer)))];
+        if (invocations.length === 1) {
+          leafLabel = invocations[0];
+        } else if (invocations.length > 1) {
+          // The whole command line is this one block of text, so listing what it
+          // ran describes it exactly; the leading `+` marks it as several.
+          const listed = invocations.slice(0, 3).join(' + ');
+          const rest = invocations.length > 3 ? ` + ${invocations.length - 3} more` : '';
+          leafLabel = `+ ${listed}${rest}`;
+          if (leafLabel.length > 140) leafLabel = `${leafLabel.slice(0, 140)}…`;
+        }
       } else if (subject) {
         frames.push(subject);
+        leafLabel = `${block.name} ${subject}`;
+      } else {
+        leafLabel = `${block.name} call`;
       }
 
-      add(frames, CATEGORY['Tool call'], bytes, lineOf(`${block.id}:call`));
+      add(frames, CATEGORY['Tool call'], bytes, lineOf(`${block.id}:call`), leafLabel);
       continue;
     }
 
@@ -178,7 +198,8 @@ function attributeEntry(entry, toolUses, add, lineFor) {
       const frames = [`${name} (output)`];
       const subject = use ? toolSubject(name, use.input) : null;
       if (subject) frames.push(subject);
-      add(frames, CATEGORY['Tool output'], byteLength(text), outputLine);
+      add(frames, CATEGORY['Tool output'], byteLength(text), outputLine,
+        subject ? `${name} ${subject}` : `${name} output`);
       continue;
     }
 
@@ -214,10 +235,19 @@ function attributeBashOutput(use, output, add, outputLine) {
       ['Bash (output)', ...bashFrames(chunk)],
       isSeparator ? CATEGORY.Other : CATEGORY['Tool output'],
       bytes,
-      outputLine === undefined ? undefined : outputLine + consumed
+      outputLine === undefined ? undefined : outputLine + consumed,
+      bashLeafLabel(chunk)
     );
     consumed += newlines;
   }
+}
+
+// How a message is recognised in a transcript: its opening words. Long enough
+// to tell two apart, short enough to read in a call tree row.
+function firstWords(text) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!flat) return null;
+  return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
 }
 
 function countNewlines(text) {
@@ -275,8 +305,8 @@ function buildTrack({
 
   const builder = new SizeProfileBuilder(shared);
   builder.useSource(options.sourceFile, transcript.text, processName);
-  const add = (frames, category, bytes, line) =>
-    builder.add(frames, category, bytes, line);
+  const add = (frames, category, bytes, line, leafLabel) =>
+    builder.add(frames, category, bytes, line, leafLabel);
 
   for (const entry of resident) {
     attributeEntry(entry, toolUses, add, transcript.lineFor);

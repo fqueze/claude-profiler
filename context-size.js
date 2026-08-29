@@ -18,7 +18,9 @@ const {
   bashFrames,
   toolSubject,
   byteLength,
-  resultText
+  resultText,
+  describeFrame,
+  summarizeNames
 } = require('./size-profile.js');
 const { parseCommand } = require('./shell-parse.js');
 
@@ -138,11 +140,13 @@ function attributeEntry(entry, toolUses, add) {
         // it the biggest part of the call.
         const command = block.input?.command || '';
         const segments = parseCommand(command);
+        // Named the same way as the output frames, subcommand included, so a
+        // call and its output sit under matching names in the tree.
         const producers = [...new Set(
           segments.filter(s => s.producer && !s.producer.isSetup && !s.isEcho)
-            .map(s => s.producer.name)
+            .map(s => describeFrame(s.producer))
         )];
-        if (producers.length > 0) frames.push(producers.slice(0, 3).join(' + '));
+        if (producers.length > 0) frames.push(summarizeNames(producers));
       } else if (subject) {
         frames.push(subject);
       }

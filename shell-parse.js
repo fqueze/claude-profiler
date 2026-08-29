@@ -16,8 +16,7 @@
 // that is what a size profile is being read for.
 const FILTERS = new Set([
   'grep', 'egrep', 'fgrep', 'rg', 'head', 'tail', 'sed', 'awk', 'cut', 'sort',
-  'uniq', 'wc', 'tr', 'jq', 'xargs', 'tee', 'column', 'fold', 'nl', 'rev',
-  'python3', 'python', 'perl'
+  'uniq', 'wc', 'tr', 'jq', 'xargs', 'tee', 'column', 'fold', 'nl', 'rev'
 ]);
 
 // Wrappers that run another command; the interesting name is the inner one.
@@ -31,6 +30,10 @@ const SETUP = new Set(['cd', 'export', 'set', 'unset', 'source', '.', 'eval', 'u
 // Shell keywords that frame a compound command rather than naming a program.
 // `do`/`done`/`then`/`fi` end up as their own segments because the `;` before
 // them is a real separator; they produce nothing and are dropped.
+// A loop names a variable rather than a subcommand, so `for t in …` and
+// `for i in …` must not become two different frames.
+const LOOP_KEYWORDS = new Set(['for', 'while', 'until', 'if', 'case', 'select']);
+
 const KEYWORDS = new Set(['do', 'done', 'then', 'fi', 'else', 'elif', 'esac', 'in', '{', '}']);
 
 // Constructs that test or annotate rather than produce output.
@@ -289,18 +292,24 @@ function describeStage(words) {
   // Leading bare words are subcommands; they identify what the tool did and are
   // worth keeping in the frame name.
   const subcommands = [];
-  for (const word of rest) {
-    if (word.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) break;
-    if (!/^[a-z][a-z0-9-]*$/.test(word)) break;
-    subcommands.push(word);
-    if (subcommands.length === 2) break;
+  if (!LOOP_KEYWORDS.has(name)) {
+    for (const word of rest) {
+      if (word.startsWith('-') || word.startsWith('<<')) break;
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) break;
+      if (!/^[a-z][a-z0-9-]*$/.test(word)) break;
+      subcommands.push(word);
+      if (subcommands.length === 2) break;
+    }
   }
 
-  const flags = rest.filter(word => word.startsWith('-') && word.length <= 12).slice(0, 2);
+  const flags = rest
+    .filter(word => word.startsWith('-') && word !== '-' && word.length <= 12)
+    .slice(0, 2);
 
   // The first argument that is not a flag or a subcommand, shortened.
   const args = rest.filter(word =>
     !word.startsWith('-') &&
+    !word.startsWith('<<') &&
     !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) &&
     !subcommands.includes(word)
   );

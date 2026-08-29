@@ -152,7 +152,8 @@ function bashFrames(chunk) {
     // Setup-only, or an echo: name it after whatever is there.
     const only = chunk.segments[0];
     if (!only) return ['(unattributed)'];
-    return [only.isEcho ? 'echo (separator)' : only.producer ? only.producer.name : '(unattributed)'];
+    if (only.isEcho) return ['echo (separator)'];
+    return only.producer ? [describeFrame(only.producer)] : ['(unattributed)'];
   }
 
   // Several commands share one chunk when no anchor separates them. A loop is
@@ -161,12 +162,14 @@ function bashFrames(chunk) {
   if (producers.length > 1) {
     const loop = producers.find(s => LOOPS.has(s.producer.name));
     const body = producers.filter(s => !LOOPS.has(s.producer.name));
-    const names = [...new Set(body.map(s => s.producer.name))];
+    // Keyed on the full name, so `mach build` and `mach test` are two commands
+    // rather than both collapsing into `mach`.
+    const names = [...new Set(body.map(s => describeFrame(s.producer)))];
 
     if (loop) {
       // A single-command loop body is the interesting case: `for … do pq …`.
       if (names.length === 1) {
-        const only = body.find(s => s.producer.name === names[0]);
+        const only = body.find(s => describeFrame(s.producer) === names[0]);
         return [`${loop.producer.name} loop`, ...stageFrames(only)];
       }
       return [
@@ -177,7 +180,7 @@ function bashFrames(chunk) {
 
     // The same command run several times is that command, not a composite.
     if (names.length === 1) {
-      const only = body.find(s => s.producer.name === names[0]);
+      const only = body.find(s => describeFrame(s.producer) === names[0]);
       return stageFrames(only);
     }
     return [summarizeNames(names)];
@@ -410,5 +413,6 @@ module.exports = {
   byteLength,
   resultText,
   echoOutput,
-  describeFrame
+  describeFrame,
+  summarizeNames
 };

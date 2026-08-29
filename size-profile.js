@@ -67,6 +67,23 @@ function echoOutput(segment) {
   return literal.length >= 4 ? literal : null;
 }
 
+// Where an echo's text appears in the output, as a whole line.
+//
+// An echo prints its own line, so a match that starts mid-line is a coincidence
+// — the same characters occurring inside some command's output. Requiring the
+// match to begin a line is what stops a prefix like `nofix run` from anchoring
+// somewhere in the middle of a marker dump.
+function findAnchorLine(output, text, from) {
+  let at = output.indexOf(text, from);
+  while (at !== -1) {
+    if (at === 0 || output[at - 1] === '\n') {
+      return at;
+    }
+    at = output.indexOf(text, at + 1);
+  }
+  return -1;
+}
+
 // Splits a Bash call's output among its segments, using the agent's own
 // `echo "=== … ==="` markers as anchors: text between two anchors was printed
 // by the commands between them. Segments before the first anchor and after the
@@ -80,9 +97,9 @@ function splitOutputByEchoes(output, segments) {
     const text = echoOutput(segment);
     if (!text) return;
 
-    const at = output.indexOf(text, searchFrom);
+    const at = findAnchorLine(output, text, searchFrom);
     if (at === -1) return;
-    anchored.push({ index, at, end: at + text.length });
+    anchored.push({ index, at, end: endOfLine(output, at + text.length) });
     searchFrom = at + text.length;
 
     // Inside a loop the same echo is printed once per iteration. Each repeat is
@@ -90,9 +107,14 @@ function splitOutputByEchoes(output, segments) {
     // whatever segments happen to sit after the echo in the source.
     if (!segment.inLoop) return;
     for (;;) {
-      const repeat = output.indexOf(text, searchFrom);
+      const repeat = findAnchorLine(output, text, searchFrom);
       if (repeat === -1) break;
-      anchored.push({ index, at: repeat, end: repeat + text.length, isRepeat: true });
+      anchored.push({
+        index,
+        at: repeat,
+        end: endOfLine(output, repeat + text.length),
+        isRepeat: true
+      });
       searchFrom = repeat + text.length;
     }
   });
@@ -101,7 +123,7 @@ function splitOutputByEchoes(output, segments) {
 
   // Nothing to go on: the whole output belongs to the producers as a group.
   if (anchored.length === 0) {
-    return [{ segments: segments.filter(s => !s.isEcho), text: output }];
+    return [{ segments: segments.filter(s => !s.isEcho), text: output, at: 0 }];
   }
 
   const chunks = [];
@@ -110,7 +132,8 @@ function splitOutputByEchoes(output, segments) {
   if (anchored[0].at > 0) {
     chunks.push({
       segments: segments.slice(0, anchored[0].index).filter(s => !s.isEcho),
-      text: output.slice(0, anchored[0].at)
+      text: output.slice(0, anchored[0].at),
+      at: 0
     });
   }
 
@@ -120,7 +143,8 @@ function splitOutputByEchoes(output, segments) {
     // The echo's own bytes are attributed to the echo.
     chunks.push({
       segments: [segments[anchor.index]],
-      text: output.slice(anchor.at, anchor.end)
+      text: output.slice(anchor.at, anchor.end),
+      at: anchor.at
     });
 
     if (until <= anchor.end) return;
@@ -136,7 +160,8 @@ function splitOutputByEchoes(output, segments) {
       segments: between.length > 0
         ? between
         : segments.slice(from).filter(s => !s.isEcho),
-      text: output.slice(anchor.end, until)
+      text: output.slice(anchor.end, until),
+      at: anchor.end
     });
   });
 
@@ -169,6 +194,41 @@ function bashLeafLabel(chunk) {
   const rest = names.length > 3 ? ` + ${names.length - 3} more` : '';
   const label = `+ ${listed}${rest}`;
   return label.length > 140 ? `${label.slice(0, 140)}…` : label;
+}
+
+// The end of the line `at` falls on, so a partial anchor still covers the whole
+// line the echo printed rather than stopping in the middle of it.
+function endOfLine(output, at) {
+  const newline = output.indexOf('\n', at);
+  return newline === -1 ? output.length : newline;
+}
+
+// How many lines into the output a chunk's content begins.
+//
+// A chunk that follows an echo starts at the newline which ends the echo's line,
+// so its own content is on the line after that: the leading newlines are skipped
+// before counting, or the chunk would be reported on the line above its text and
+// collide with the echo.
+function lineOffsetOf(output, at) {
+  let start = at;
+  // Skip the newlines that end the previous line, and then any lines with
+  // nothing on them, so a chunk is reported where its content actually is.
+  while (start < output.length) {
+    if (output[start] === '\n' || output[start] === '\r') {
+      start++;
+      continue;
+    }
+    const lineEnd = output.indexOf('\n', start);
+    const line = output.slice(start, lineEnd === -1 ? output.length : lineEnd);
+    if (line.trim() !== '' || lineEnd === -1) break;
+    start = lineEnd + 1;
+  }
+
+  let lines = 0;
+  for (let i = 0; i < start && i < output.length; i++) {
+    if (output[i] === '\n') lines++;
+  }
+  return lines;
 }
 
 // Builds the stack for a chunk of Bash output: the producing command, then the
@@ -570,6 +630,7 @@ module.exports = {
   CATEGORY,
   SizeProfileBuilder,
   splitOutputByEchoes,
+  lineOffsetOf,
   bashFrames,
   toolSubject,
   byteLength,

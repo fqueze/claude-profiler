@@ -201,33 +201,45 @@ const rendered = renderTranscript(sessionEntries, new Map([['tu1', toolUse]]), {
 const documentLines = rendered.text.split('\n');
 const at = (line) => documentLines[line - 1];
 
-check('transcript keys the user prompt', at(rendered.lineFor.get('u1')),
+// The document is the context window and nothing else, so every keyed line is
+// the content itself rather than a header describing it.
+check('a prompt starts at its own text', at(rendered.lineFor.get('u1')),
   'please list the files');
-check('transcript keys the assistant text', at(rendered.lineFor.get('u2')),
+check('assistant text starts at its own text', at(rendered.lineFor.get('u2')),
   'Listing them.');
-// A Bash call is written as a shell prompt line, timestamped, so it reads as
-// the thing that produced the output below it.
-check('transcript keys the tool call', at(rendered.lineFor.get('tu1:call')),
-  '21:08:25 $ echo "=== hello ==="; ls');
-check('transcript keys the tool output', at(rendered.lineFor.get('tu1:output')),
+check('a tool call starts at the command', at(rendered.lineFor.get('tu1:call')),
+  'echo "=== hello ==="; ls');
+check('a tool result starts at its first line', at(rendered.lineFor.get('tu1:output')),
   '=== hello ===');
 
-// The output follows its command directly, with nothing in between: a small
-// result needs no size note, and there is no separator to skip past.
-check('output follows the command line directly',
-  at(rendered.lineFor.get('tu1:output') - 1),
-  '21:08:25 $ echo "=== hello ==="; ls');
+// Nothing may be added that the model was not sent: an invented line would sit
+// between real ones and shift every line below it away from what was measured.
+const invented = documentLines.filter(line =>
+  /^\d\d:\d\d:\d\d/.test(line) ||      // a timestamp
+  /^\s*\(\d+(\.\d+)? [KMG]?B/.test(line) || // a size note
+  /^\$ /.test(line) ||                    // a shell prompt
+  /^────/.test(line) ||                    // a separator
+  /^# /.test(line));                       // a header
+check('the document invents no lines', invented, []);
 
-// A call's duration is the gap between the request and its result. Both entries
-// are stamped when they are logged, so neither alone says how long it took.
-const { timeToolCalls, formatDuration } = require('./transcript.js');
-const timed = timeToolCalls(sessionEntries);
-check('call duration comes from the request/result pair',
-  timed.get('tu1').end - timed.get('tu1').start,
-  1000);
-check('durations read in seconds past a second', formatDuration(11500), '11.5 s');
-check('durations read in ms below a second', formatDuration(650), '650 ms');
-check('durations read in minutes past a minute', formatDuration(95000), '1m 35s');
+// Every non-blank line of the document must be a line of something the model
+// was sent. This is the property the line numbers depend on.
+const sourceLines = new Set();
+for (const entry of sessionEntries) {
+  const content = entry.message.content;
+  const texts = typeof content === 'string'
+    ? [content]
+    : content.map((block) =>
+        block.type === 'text' ? block.text
+        : block.type === 'tool_use' ? block.input.command
+        : block.type === 'tool_result' ? block.content
+        : '');
+  for (const text of texts) {
+    for (const line of String(text).split('\n')) sourceLines.add(line);
+  }
+}
+const foreign = documentLines.filter(line => line !== '' && !sourceLines.has(line));
+check('every line of the document came from the context', foreign, []);
 
 // Lines are 1-based, as the source view expects.
 check('lines are 1-based', Math.min(...rendered.lineFor.values()) >= 1, true);

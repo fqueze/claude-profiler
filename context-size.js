@@ -15,6 +15,7 @@ const {
   CATEGORY,
   SizeProfileBuilder,
   splitOutputByEchoes,
+  lineOffsetOf,
   bashFrames,
   toolSubject,
   byteLength,
@@ -213,6 +214,9 @@ function attributeEntry(entry, toolUses, add, lineFor) {
 function attributeBashOutput(use, output, add, outputLine) {
   const command = use.input?.command || '';
   const segments = parseCommand(command);
+  // The transcript renders CRLF as LF, so offsets have to be counted on the
+  // same text the lines were made from or they drift by a line per CR.
+  const normalized = output.replace(/\r\n/g, '\n');
 
   if (segments.length === 0) {
     add(['Bash (output)'], CATEGORY['Tool output'], byteLength(output), outputLine);
@@ -221,25 +225,34 @@ function attributeBashOutput(use, output, add, outputLine) {
 
   // Each chunk points at its own place within the output, so double-clicking a
   // command in the tree lands on what that command printed rather than at the
-  // top of a long combined output.
-  let consumed = 0;
+  // top of a long combined output. The offset is derived from where the chunk
+  // starts in the output: adding up the chunks' own line counts puts every chunk
+  // of a call on one line, because a chunk that does not end in a newline
+  // contributes nothing to such a running total.
   for (const chunk of splitOutputByEchoes(output, segments)) {
     const bytes = byteLength(chunk.text);
-    const newlines = countNewlines(chunk.text);
-    if (bytes === 0) {
-      consumed += newlines;
-      continue;
-    }
+    if (bytes === 0) continue;
     const isSeparator = chunk.segments.length === 1 && chunk.segments[0].isEcho;
     add(
       ['Bash (output)', ...bashFrames(chunk)],
       isSeparator ? CATEGORY.Other : CATEGORY['Tool output'],
       bytes,
-      outputLine === undefined ? undefined : outputLine + consumed,
+      outputLine === undefined
+        ? undefined
+        : outputLine + lineOffsetOf(normalized, normalizedOffset(output, chunk.at)),
       bashLeafLabel(chunk)
     );
-    consumed += newlines;
   }
+}
+
+// A character offset in the raw output, translated to the same position in the
+// CRLF-normalised text the transcript was rendered from.
+function normalizedOffset(output, at) {
+  let removed = 0;
+  for (let i = 0; i + 1 < at && i + 1 < output.length; i++) {
+    if (output[i] === '\r' && output[i + 1] === '\n') removed++;
+  }
+  return at - removed;
 }
 
 // How a message is recognised in a transcript: its opening words. Long enough
@@ -248,14 +261,6 @@ function firstWords(text) {
   const flat = String(text || '').replace(/\s+/g, ' ').trim();
   if (!flat) return null;
   return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
-}
-
-function countNewlines(text) {
-  let count = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '\n') count++;
-  }
-  return count;
 }
 
 // Builds one track: the context window of one agent at the point given.

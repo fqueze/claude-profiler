@@ -139,37 +139,29 @@ the most recent `compact_boundary` entry.
 
 ## Reading the output in the source view
 
-Both profiles carry the session transcript, so double-clicking a frame in the
-call tree or the flame graph opens the source view scrolled to the output that
-frame is about — the question "was that command's output worth its bytes?" is
-one double-click from the frame that raised it. The gutter shows how many bytes
-each line contributed, since line hits are the sample weights, so a long run of
+Both profiles carry the context window as text, so double-clicking a frame in the
+call tree or the flame graph opens the source view scrolled to the content that
+frame is about — the question "was that command's output worth its bytes?" is one
+double-click from the frame that raised it. The gutter shows how many bytes each
+line contributed, since line hits are the sample weights, so a long run of
 near-identical lines reads as exactly that.
 
-A tool call is written the way a terminal would show it: the command, then what
-it printed. There is nothing in between to skip past, because the view scrolls
-to the right line by itself.
-
-```
-21:16:53 $ cd /Users/me/firefox/artifacts; mkdir -p sbfail && mv WqG3Pv_* sbfail/ …
-  (10.2 KB, 3.4 s)
-18987:[task 2026-08-28T19:37:10.760+00:00] INFO - TEST-START | browser/…
-18996:[task 2026-08-28T19:37:13.122+00:00] INFO - TEST-PASS | browser/…
-```
-
-The size note appears once the output is worth wondering about, from 4 KB up.
-Its duration is the gap between the request and its result: both log entries are
-written when the message is logged, so neither timestamp alone says how long a
-command took.
-
-The `--size` transcript covers only what was resident in the profiled window;
-the timeline's covers the whole track.
+The document is the window and nothing else: every line is text the model was
+actually sent, in order, with one blank line between blocks. Nothing is added for
+readability — no timestamps, no sizes, no separators, no shell prompts. Such a
+line would sit between lines that are in the context, shifting everything below
+it away from what the profile measured, and its weight in the gutter would belong
+to nothing. A Bash call appears as its command text, since that is what occupies
+the window; other tools appear as the JSON they were sent.
 
 Transcripts are embedded in the profile itself, in the sources table's `content`
 column, so the source view needs no symbol server and a saved or shared profile
 stays readable on its own. This is what fixes both profiles at format version
 64: earlier versions have that table rebuilt by the front end's upgraders, which
 would drop the embedded text.
+
+The `--size` document covers only what was resident in the profiled window; the
+timeline's covers the whole track.
 
 ## What the profile contains
 

@@ -62,7 +62,7 @@ check('repeated command collapses',
 // A loop body is the repeated unit; the loop itself produced nothing.
 check('loop body attributed under the loop',
   attribute('for t in A B; do head -5 "$t.log"; done', 'x\ny\n')[0].frames,
-  'for loop/head -5 $t.log');
+  'for loop/head -5');
 
 // An echo with a variable still anchors on its literal prefix, once per
 // iteration of the loop it sits in.
@@ -71,8 +71,37 @@ check('repeated partial anchor in a loop',
     'for t in A B; do echo "=== $t"; head -2 "$t.log"; done',
     '=== A\nfirst\n=== B\nsecond\n'
   ).map(chunk => chunk.frames),
-  ['for loop/echo', 'for loop/head -2 $t.log',
-   'for loop/echo', 'for loop/head -2 $t.log']);
+  ['for loop/echo', 'for loop/head -2',
+   'for loop/echo', 'for loop/head -2']);
+
+// A filter's operand differs at every call site — a line range, a pattern — so
+// it is dropped, and calls that did the same thing land on one frame. The flags
+// stay, since they are what the filter did.
+const { describeFrame } = require('./size-profile.js');
+const filterName = (command) => describeFrame(parseCommand(command)[0].producer);
+
+check('sed line ranges aggregate', [
+  filterName('sed -n 20430,20500p f'),
+  filterName('sed -n 100,180p f'),
+  filterName('sed -n 16,30p;60,130p f')
+], ['sed -n', 'sed -n', 'sed -n']);
+
+check('grep patterns aggregate by flags', [
+  filterName('grep -viE "^  PID" f'),
+  filterName('grep -viE other f'),
+  filterName('grep -n foo f')
+], ['grep -viE', 'grep -viE', 'grep -n']);
+
+// A count is the flag, so how much was kept stays visible.
+check('head keeps its count', [filterName('head -20 f'), filterName('head -60 f')],
+  ['head -20', 'head -60']);
+
+// A producer keeps its subcommand but not its arguments.
+check('producer keeps subcommand, drops arguments', [
+  filterName('profiler-cli marker info m-284'),
+  filterName('profiler-cli marker info m-999'),
+  filterName('fx-tests try 53afe8eb49ab --all-jobs')
+], ['profiler-cli marker info', 'profiler-cli marker info', 'fx-tests try']);
 
 // Bytes must be conserved: every byte of output lands somewhere.
 const conservation = [

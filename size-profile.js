@@ -210,14 +210,17 @@ function summarizeNames(names) {
 }
 
 // A frame is named after the command and its subcommand, so that every
-// `profiler-cli marker info` aggregates into one place in the tree. Flags are
-// left out of a producer's name — they fragment it without saying much — but
-// kept for a filter, where `head -30` is exactly the interesting part.
+// `profiler-cli marker info` aggregates into one place in the tree.
+//
+// A filter keeps its flags, since `head -20` and `sed -n` describe what the
+// filter did, but not its operand: the line range of a `sed -n 20430,20500p` or
+// the pattern of a `grep -viE …` is different at every call site, and including
+// it turns one filter into dozens of frames that never aggregate. A producer
+// keeps neither, its flags fragment the name without saying much.
 function describeFrame(stage) {
   const parts = [stage.name, ...(stage.subcommands || [])];
-  if (stage.isFilter) {
-    if (stage.flags.length > 0) parts.push(stage.flags.join(' '));
-    if (stage.detail && stage.detail.length <= 24) parts.push(stage.detail);
+  if (stage.isFilter && stage.flags.length > 0) {
+    parts.push(stage.flags.join(' '));
   }
   return parts.join(' ');
 }

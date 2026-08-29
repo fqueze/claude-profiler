@@ -297,6 +297,10 @@ function describeStage(words) {
       if (word.startsWith('-') || word.startsWith('<<')) break;
       if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) break;
       if (!/^[a-z][a-z0-9-]*$/.test(word)) break;
+      // A commit hash or an id is an operand, not a subcommand: it is different
+      // at every call site and would make one frame per invocation. Real
+      // subcommands are words, so anything long with digits in it is rejected.
+      if (word.length >= 7 && /\d/.test(word)) break;
       subcommands.push(word);
       if (subcommands.length === 2) break;
     }

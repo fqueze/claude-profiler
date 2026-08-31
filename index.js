@@ -7,7 +7,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 // Attribution of a message's bytes, shared with the size profile so both tools
 // build the same stacks.
-const { attributeEntry } = require('./context-size.js');
+const { attributeEntry, contextChain, calibrate } = require('./context-size.js');
 const { renderTranscript } = require('./transcript.js');
 
 // Prices per million tokens, from
@@ -72,6 +72,14 @@ function calculateCost(usage, pricing) {
     total: inputCost + outputCost + cacheWriteCost + cacheReadCost
   };
 }
+
+// Indexes into the timeline profile's category list below. Idle is drawn as
+// nothing, so an idle stretch reads as empty rather than as another kind of work.
+const OTHER_CATEGORY = 0;
+const MESSAGES_CATEGORY = 1;
+const TOOLS_CATEGORY = 3;
+const MODEL_CATEGORY = 5;
+const IDLE_CATEGORY = 6;
 
 // A running total that keeps the four parts of a cost as well as their sum, so
 // the cumulative graphs can be stacked by what the money went on rather than
@@ -182,6 +190,143 @@ function costGraphs() {
     // the tooltip's sake — a band of height zero is not drawn.
     { key: ZERO_BAND, color: 'grey', type: 'bar' }
   ];
+}
+
+// What the context window held at each API call, split the way the timeline is
+// coloured: the messages, the tools, the sub-agents. The size profile answers
+// this for one chosen call by walking that call's context chain and attributing
+// every message in it; this is the same walk, done for every call.
+//
+// Naively that is O(calls × window), and 10 seconds on a long session. But a
+// call's context is the previous call's context plus whatever has happened
+// since, so the totals are accumulated as the conversation goes and each
+// message is attributed once. A compaction is the exception: it drops what came
+// before, so the running totals start again from that call's own chain.
+const CONTEXT_PARTS = [
+  // The system prompt and the tool schemas, which are in the window but never
+  // in the log. Its size is inferred, so it goes at the bottom where it is
+  // least likely to be mistaken for something measured, and grey like the
+  // timeline's own catch-all.
+  { key: 'unlogged', label: 'System prompt + tool schemas (not logged)', color: 'grey' },
+  { key: 'messages', label: 'Messages', color: 'blue', category: MESSAGES_CATEGORY },
+  { key: 'tools', label: 'Tools', color: 'green', category: TOOLS_CATEGORY },
+  { key: 'model', label: 'Model', color: 'purple', category: MODEL_CATEGORY },
+  { key: 'other', label: 'Other', color: 'ink', category: OTHER_CATEGORY }
+];
+
+function contextBreakdowns(entries, apiCalls) {
+  const byUuid = new Map();
+  const boundaries = new Set();
+  const toolUses = new Map();
+  for (const entry of entries) {
+    if (entry.uuid) byUuid.set(entry.uuid, entry);
+    if (entry.subtype === 'compact_boundary' || entry.isCompactSummary) {
+      boundaries.add(entry.uuid);
+    }
+    const content = entry.message?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type === 'tool_use') toolUses.set(block.id, block);
+      }
+    }
+  }
+
+  // Bytes per timeline category for one message, worked out once.
+  const attributed = new Map();
+  function bytesOf(entry) {
+    if (!attributed.has(entry.uuid)) {
+      const bytes = {};
+      const role = entry.message?.role || entry.type;
+      attributeEntry(entry, toolUses, (frames, category, count) => {
+        const timeline = sizeCategoryToTimeline(category, role);
+        bytes[timeline] = (bytes[timeline] || 0) + count;
+      });
+      attributed.set(entry.uuid, bytes);
+    }
+    return attributed.get(entry.uuid);
+  }
+
+  let counted = new Set();
+  let running = {};
+  return apiCalls.map((call) => {
+    const chain = contextChain(call.msg, byUuid, boundaries);
+    const window = new Set(chain.map(entry => entry.uuid));
+
+    // Anything that was in the window and is not any more means the
+    // conversation was compacted, and the totals no longer describe it.
+    let compacted = false;
+    for (const uuid of counted) {
+      if (!window.has(uuid)) {
+        compacted = true;
+        break;
+      }
+    }
+    if (compacted) {
+      counted = new Set();
+      running = {};
+    }
+
+    for (const entry of chain) {
+      if (counted.has(entry.uuid)) continue;
+      counted.add(entry.uuid);
+      const bytes = bytesOf(entry);
+      for (const category of Object.keys(bytes)) {
+        running[category] = (running[category] || 0) + bytes[category];
+      }
+    }
+
+    return { ...running };
+  });
+}
+
+// The bands of the context chart, stacked like the cost ones and scaled to the
+// call's own token count. The attribution is in bytes, since that is what a
+// transcript is measured in, but the chart is about how full the window is —
+// so the shares are byte shares and the height is tokens, which keeps the graph
+// reading the same as when it was a single line of the token count.
+function stackedContext(breakdown, tokens, overheadBytes) {
+  const bytes = CONTEXT_PARTS.map(part => part.category === undefined
+    ? overheadBytes
+    : breakdown[part.category] || 0);
+  const total = bytes.reduce((sum, value) => sum + value, 0);
+
+  const data = { [ZERO_BAND]: 0 };
+  let running = 0;
+  CONTEXT_PARTS.forEach((part, index) => {
+    running += bytes[index];
+    // Before the first call has been attributed there is nothing to divide by.
+    data[stackKey(part)] = total > 0 ? Math.round(tokens * running / total) : 0;
+    data[part.key] = bytes[index];
+  });
+  return data;
+}
+
+function contextGraphs() {
+  return [
+    ...[...CONTEXT_PARTS].reverse().map(part => ({
+      key: stackKey(part),
+      color: part.color,
+      type: 'bar'
+    })),
+    { key: ZERO_BAND, color: 'grey', type: 'bar' }
+  ];
+}
+
+function contextFields() {
+  return [
+    { key: 'tokens', label: 'Context Size', format: 'integer' },
+    ...CONTEXT_PARTS.map(part => ({ key: part.key, label: part.label, format: 'bytes' })),
+    // Drawn, not read: the bands come from these.
+    ...CONTEXT_PARTS.map(part => ({ key: stackKey(part), hidden: true })),
+    { key: ZERO_BAND, hidden: true }
+  ];
+}
+
+// Everything the model was sent, whether it came from the cache or not.
+function contextTokensOf(usage) {
+  return (usage.input_tokens || 0) +
+    (usage.cache_read_input_tokens || 0) +
+    (usage.cache_creation_input_tokens || 0);
 }
 
 // One line of a cost breakdown: what that part of a call cost and how many
@@ -642,13 +787,6 @@ function sourceSlug(label) {
   return (cleaned || 'session').slice(0, 60);
 }
 
-// Indexes into the timeline profile's category list below. Idle is drawn as
-// nothing, so an idle stretch reads as empty rather than as another kind of work.
-const MESSAGES_CATEGORY = 1;
-const TOOLS_CATEGORY = 3;
-const MODEL_CATEGORY = 5;
-const IDLE_CATEGORY = 6;
-
 // The size profile has its own category list; the timeline profile's is about
 // what happened rather than where bytes came from, so they are mapped over.
 //
@@ -679,6 +817,7 @@ function buildThread({
   entries,
   messages,
   apiCalls,
+  overheadBytes,
   totalCostPoints,
   startTime,
   threadName,
@@ -853,19 +992,28 @@ function buildThread({
   const agentCostNameIdx = addString('Agent Cost ($)');
   const contextSizeNameIdx = addString('Context Size');
 
-  apiCalls.forEach(({ msg, costs, agentCost, start, time }, index) => {
+  apiCalls.forEach(({ msg, costs, agentCost, context, start, time }, index) => {
     const usage = msg.message.usage;
     const relativeTime = time - startTime;
+    const contextTokens = contextTokensOf(usage);
 
     // Everything the model was sent is the context at that point, whether it
     // came from the cache or not. It grows as the agent works and drops back
-    // when the conversation is compacted.
-    addMarker(contextSizeNameIdx, relativeTime, relativeTime, 0, 1, {
-      type: 'ContextSize',
-      tokens: (usage.input_tokens || 0) +
-        (usage.cache_read_input_tokens || 0) +
-        (usage.cache_creation_input_tokens || 0)
-    });
+    // when the conversation is compacted. Held until the next call, since a bar
+    // is only as wide as its own marker.
+    addMarker(
+      contextSizeNameIdx,
+      relativeTime,
+      (index + 1 < apiCalls.length ? apiCalls[index + 1].time : unregisterTime + startTime) -
+        startTime,
+      1,
+      1,
+      {
+        type: 'ContextSize',
+        tokens: contextTokens,
+        ...stackedContext(context, contextTokens, overheadBytes)
+      }
+    );
 
     if (costs.total > 0) {
       // An interval over the response it paid for: a bar wide enough to hover,
@@ -1229,6 +1377,22 @@ function createFirefoxProfile(jsonlData, subagents) {
       call.agentCost = running.add(call.costs);
     });
     track.cost = running.total();
+
+    // What the window was made of at each of those calls, and how much of it
+    // the log never saw: fitting bytes against the tokens the API reported
+    // gives the fixed overhead every call carries.
+    const breakdowns = contextBreakdowns(track.entries, track.apiCalls);
+    const calibration = calibrate(track.apiCalls.map((call, index) => ({
+      tokens: contextTokensOf(call.msg.message.usage),
+      bytes: Object.values(breakdowns[index]).reduce((sum, value) => sum + value, 0)
+    })));
+    track.overheadBytes = Math.max(
+      0,
+      Math.round(calibration.overhead * calibration.bytesPerToken)
+    );
+    track.apiCalls.forEach((call, index) => {
+      call.context = breakdowns[index];
+    });
   });
 
   const sessionCost = new RunningCost();
@@ -1294,6 +1458,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       entries: track.entries,
       messages: track.messages,
       apiCalls: track.apiCalls,
+      overheadBytes: track.overheadBytes,
       totalCostPoints: track.id === 'main' ? totalCostPoints : null,
       startTime,
       threadName: track.threadName,
@@ -1519,16 +1684,8 @@ function createFirefoxProfile(jsonlData, subagents) {
       name: 'ContextSize',
       tooltipLabel: '{marker.name}',
       display: [],
-      fields: [
-        {
-          key: 'tokens',
-          label: 'Context Size',
-          format: 'integer'
-        }
-      ],
-      graphs: [
-        { key: 'tokens', color: 'teal', type: 'line' }
-      ]
+      fields: contextFields(),
+      graphs: contextGraphs()
     },
     {
       name: 'Cost',

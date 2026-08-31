@@ -651,6 +651,52 @@ for (let index = 0; index < idleThread.markers.length; index++) {
 check('there are cumulative markers to check', checkedTotals > 0, true);
 check('the top band and the parts both come to the total', wrongTotals, []);
 
+// The context chart is stacked the same way, but by what the window is made of
+// rather than what it cost, and in the timeline's own colours so a band matches
+// the samples underneath it.
+const contextSchema = withIdle.meta.markerSchema.find(schema => schema.name === 'ContextSize');
+check('the context chart is drawn as filled bars',
+  contextSchema.graphs.every(graph => graph.type === 'bar'), true);
+
+// Messages blue, tools green, model purple: the same colours the timeline gives
+// those categories, looked up rather than repeated here.
+const categoryColor = (name) =>
+  withIdle.meta.categories[withIdle.meta.categories.findIndex(c => c.name === name)].color;
+const bandColor = (key) =>
+  contextSchema.graphs.find(graph => graph.key === `${key}Stacked`).color;
+check('messages band matches the timeline', bandColor('messages'), categoryColor('Messages'));
+check('tools band matches the timeline', bandColor('tools'), categoryColor('Tools'));
+check('model band matches the timeline', bandColor('model'), categoryColor('Model'));
+
+// The top band is the whole window, so the chart's height is the token count the
+// API reported rather than a byte total that only approximates it.
+const contextKeys = contextSchema.graphs.map(graph => graph.key);
+let contextMarkers = 0;
+const contextProblems = [];
+for (let index = 0; index < idleThread.markers.length; index++) {
+  const data = idleThread.markers.data[index];
+  if (!data || data.type !== 'ContextSize') continue;
+  contextMarkers++;
+  if (!contextKeys.every(key => key in data)) contextProblems.push('missing band');
+  if (data[contextKeys[0]] !== data.tokens) contextProblems.push('top band');
+  const rising = [...contextKeys].reverse().map(key => data[key]);
+  for (let band = 1; band < rising.length; band++) {
+    if (rising[band] < rising[band - 1]) contextProblems.push('unstacked');
+  }
+  if (idleThread.markers.endTime[index] <= idleThread.markers.startTime[index] &&
+      index !== idleThread.markers.length - 1) {
+    // A bar with no duration is one pixel wide; only the last may end where the
+    // track does.
+    const isLast = !idleThread.markers.data
+      .slice(index + 1)
+      .some(other => other && other.type === 'ContextSize');
+    if (!isLast) contextProblems.push('widthless');
+  }
+}
+check('there are context markers to check', contextMarkers > 0, true);
+check('the context chart stacks up to the reported token count',
+  [...new Set(contextProblems)], []);
+
 // The size profile measures bytes, not wall clock, so it has no idle to show.
 check('the size profile has no Idle category',
   built.meta.categories.some(c => c.name === 'Idle'), false);

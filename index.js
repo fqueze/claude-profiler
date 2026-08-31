@@ -114,7 +114,13 @@ const COST_PARTS = [
 // Every key a graph names has to be present on every marker or the marker is
 // dropped from the chart, so a part that cost nothing still gets its 0.
 function stackedCost(costs) {
-  const data = {};
+  // A band pinned to zero, drawn last and so under everything else. A filled
+  // line is scaled between the smallest and largest value in view rather than
+  // from zero, so without this the floor of the cumulative charts is whatever
+  // the cheapest call happened to cost and the bands stop being true shares of
+  // the total. Bars divide by the maximum and do not need it, but it costs them
+  // nothing: a band of height zero is skipped.
+  const data = { [ZERO_BAND]: 0 };
   let running = 0;
   for (const part of COST_PARTS) {
     running += costs[part.key] || 0;
@@ -122,6 +128,8 @@ function stackedCost(costs) {
   }
   return data;
 }
+
+const ZERO_BAND = 'zeroBand';
 
 function stackKey(part) {
   return `${part.key}Stacked`;
@@ -143,20 +151,29 @@ function cumulativeCostFields(totalLabel) {
     { key: 'total', label: totalLabel, format: 'decimal' },
     ...COST_PARTS.map(part => ({ key: part.key, label: part.label, format: 'decimal' })),
     // Drawn, not read: the bands come from these.
-    ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true }))
+    ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true })),
+    { key: ZERO_BAND, hidden: true }
   ];
 }
 
-// The bands of a cost chart, biggest first: the topmost is the full total, and
-// each one after it cuts away the part above. Same colour per part in every
-// chart, so a spike on the Cost chart is the band that grows on the cumulative
-// ones.
+// The bands of a cost chart, biggest first. Every entry is drawn from the
+// bottom of the canvas over the one before it, so a band's visible slice runs
+// from its own top edge down to the edge of the next one in, which is what makes
+// the stack read as shares of the total. Same colour per part in every chart, so
+// a spike on the Cost chart is the band that grows on the cumulative ones.
+//
+// This is the shape mach's resource monitor uses for its CPU chart, which stacks
+// the same way.
 function costGraphs(type) {
-  return [...COST_PARTS].reverse().map(part => ({
-    key: stackKey(part),
-    color: part.color,
-    type
-  }));
+  return [
+    ...[...COST_PARTS].reverse().map(part => ({
+      key: stackKey(part),
+      color: part.color,
+      type
+    })),
+    // Last, so it is bottom-most, and only there to hold the scale at zero.
+    { key: ZERO_BAND, color: 'grey', type }
+  ];
 }
 
 // One line of a cost breakdown: what that part of a call cost and how many
@@ -1526,7 +1543,8 @@ function createFirefoxProfile(jsonlData, subagents) {
           format: 'string'
         },
         // Drawn, not read: the bands come from these.
-        ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true }))
+        ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true })),
+        { key: ZERO_BAND, hidden: true }
       ],
       graphs: costGraphs('bar')
     },

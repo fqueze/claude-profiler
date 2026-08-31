@@ -669,9 +669,9 @@ function buildThread({
   const agentCostNameIdx = addString('Agent Cost ($)');
   const contextSizeNameIdx = addString('Context Size');
 
-  apiCalls.forEach(({ msg, costs, agentCost }) => {
+  apiCalls.forEach(({ msg, costs, agentCost, start, time }) => {
     const usage = msg.message.usage;
-    const relativeTime = new Date(msg.timestamp).getTime() - startTime;
+    const relativeTime = time - startTime;
 
     // Everything the model was sent is the context at that point, whether it
     // came from the cache or not. It grows as the agent works and drops back
@@ -684,7 +684,9 @@ function buildThread({
     });
 
     if (costs.total > 0) {
-      addMarker(costNameIdx, relativeTime, relativeTime, 0, 1, {
+      // An interval over the response it paid for: a bar wide enough to hover,
+      // and one that lines up with the model marker in the marker chart.
+      addMarker(costNameIdx, start - startTime, relativeTime, 1, 1, {
         type: 'Cost',
         cost: costs.total,
         output: costWithTokens(costs.output, usage.output_tokens),
@@ -986,11 +988,26 @@ function createFirefoxProfile(jsonlData, subagents) {
   // has to be accumulated in timestamp order across all tracks, since agents
   // run concurrently.
   tracks.forEach((track) => {
-    track.apiCalls = uniqueApiCalls(track.messages).map(msg => ({
-      msg,
-      time: new Date(msg.timestamp).getTime(),
-      costs: calculateCost(msg.message.usage, getPricingForModel(msg.message.model))
-    }));
+    // What a call cost is a property of the whole response, so it is measured
+    // over the same interval the model marker covers rather than pinned to the
+    // one chunk that happened to carry the usage block — which is somewhere in
+    // the middle of the response, and too narrow to hover.
+    //
+    // `time` is the end: a running total only moves once the response has
+    // landed and the amount is known.
+    const responses = new Map(
+      findModelResponses(track.messages).map(response => [response.requestId, response])
+    );
+    track.apiCalls = uniqueApiCalls(track.messages).map((msg) => {
+      const response = responses.get(msg.requestId);
+      const logged = new Date(msg.timestamp).getTime();
+      return {
+        msg,
+        start: response ? response.start : logged,
+        time: response ? response.end : logged,
+        costs: calculateCost(msg.message.usage, getPricingForModel(msg.message.model))
+      };
+    });
 
     let agentCost = 0;
     track.apiCalls.forEach((call) => {

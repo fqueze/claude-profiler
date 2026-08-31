@@ -73,6 +73,21 @@ function calculateCost(usage, pricing) {
   };
 }
 
+// One line of a cost breakdown: what that part of a call cost and how many
+// tokens bought it. A string rather than two fields, so the tooltip reads as
+// four lines instead of eight, and empty when nothing was billed — a call with
+// no cache write should not claim a $0 one.
+function costWithTokens(cost, tokens) {
+  if (!cost && !tokens) {
+    return undefined;
+  }
+  const amount = cost.toLocaleString(undefined, {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4
+  });
+  return `${amount}$ (${(tokens || 0).toLocaleString()} tokens)`;
+}
+
 function readJsonlFile(filePath) {
   const content = fs.readFileSync(filePath, 'utf-8');
   const lines = content.trim().split('\n');
@@ -646,11 +661,10 @@ function buildThread({
     });
   });
 
-  // Separate token usage markers for each unique API call
-  const outputTokensNameIdx = addString('Output Tokens');
-  const inputTokensNameIdx = addString('Input Tokens');
-  const cacheReadTokensNameIdx = addString('Cache Read Tokens');
-  const cacheCreationTokensNameIdx = addString('Cache Creation Tokens');
+  // One cost marker per API call. The token counts ride along in the same
+  // marker: a chart each for output, input, cache reads and cache writes cost
+  // four rows of vertical space to say what four lines of one tooltip say, and
+  // the cost bars are where one looks for an expensive call anyway.
   const costNameIdx = addString('Cost ($)');
   const agentCostNameIdx = addString('Agent Cost ($)');
   const contextSizeNameIdx = addString('Context Size');
@@ -669,42 +683,14 @@ function buildThread({
         (usage.cache_creation_input_tokens || 0)
     });
 
-    if (usage.output_tokens > 0) {
-      addMarker(outputTokensNameIdx, relativeTime, relativeTime, 0, 1, {
-        type: 'OutputTokens',
-        count: usage.output_tokens
-      });
-    }
-
-    if (usage.input_tokens > 0) {
-      addMarker(inputTokensNameIdx, relativeTime, relativeTime, 0, 1, {
-        type: 'InputTokens',
-        count: usage.input_tokens
-      });
-    }
-
-    if (usage.cache_read_input_tokens > 0) {
-      addMarker(cacheReadTokensNameIdx, relativeTime, relativeTime, 0, 1, {
-        type: 'CacheReadTokens',
-        count: usage.cache_read_input_tokens
-      });
-    }
-
-    if (usage.cache_creation_input_tokens > 0) {
-      addMarker(cacheCreationTokensNameIdx, relativeTime, relativeTime, 0, 1, {
-        type: 'CacheCreationTokens',
-        count: usage.cache_creation_input_tokens
-      });
-    }
-
     if (costs.total > 0) {
       addMarker(costNameIdx, relativeTime, relativeTime, 0, 1, {
         type: 'Cost',
         cost: costs.total,
-        input: costs.input,
-        output: costs.output,
-        cacheWrite: costs.cacheWrite,
-        cacheRead: costs.cacheRead
+        output: costWithTokens(costs.output, usage.output_tokens),
+        input: costWithTokens(costs.input, usage.input_tokens),
+        cacheRead: costWithTokens(costs.cacheRead, usage.cache_read_input_tokens),
+        cacheWrite: costWithTokens(costs.cacheWrite, usage.cache_creation_input_tokens)
       });
     }
 
@@ -1298,66 +1284,6 @@ function createFirefoxProfile(jsonlData, subagents) {
       ]
     },
     {
-      name: 'OutputTokens',
-      tooltipLabel: '{marker.name}',
-      display: [],
-      fields: [
-        {
-          key: 'count',
-          label: 'Output Tokens',
-          format: 'integer'
-        }
-      ],
-      graphs: [
-        { key: 'count', color: 'blue', type: 'bar' }
-      ]
-    },
-    {
-      name: 'InputTokens',
-      tooltipLabel: '{marker.name}',
-      display: [],
-      fields: [
-        {
-          key: 'count',
-          label: 'Input Tokens',
-          format: 'integer'
-        }
-      ],
-      graphs: [
-        { key: 'count', color: 'green', type: 'bar' }
-      ]
-    },
-    {
-      name: 'CacheReadTokens',
-      tooltipLabel: '{marker.name}',
-      display: [],
-      fields: [
-        {
-          key: 'count',
-          label: 'Cache Read Tokens',
-          format: 'integer'
-        }
-      ],
-      graphs: [
-        { key: 'count', color: 'purple', type: 'bar' }
-      ]
-    },
-    {
-      name: 'CacheCreationTokens',
-      tooltipLabel: '{marker.name}',
-      display: [],
-      fields: [
-        {
-          key: 'count',
-          label: 'Cache Creation Tokens',
-          format: 'integer'
-        }
-      ],
-      graphs: [
-        { key: 'count', color: 'orange', type: 'bar' }
-      ]
-    },
-    {
       name: 'Cost',
       tooltipLabel: '{marker.name}',
       display: [],
@@ -1367,25 +1293,27 @@ function createFirefoxProfile(jsonlData, subagents) {
           label: 'Cost',
           format: 'decimal'
         },
-        {
-          key: 'input',
-          label: 'Input Cost',
-          format: 'decimal'
-        },
+        // Pre-formatted, since each of these is a cost and the tokens that
+        // bought it rather than a number the front end could format itself.
         {
           key: 'output',
-          label: 'Output Cost',
-          format: 'decimal'
+          label: 'Output',
+          format: 'string'
         },
         {
-          key: 'cacheWrite',
-          label: 'Cache Write Cost',
-          format: 'decimal'
+          key: 'input',
+          label: 'Input',
+          format: 'string'
         },
         {
           key: 'cacheRead',
-          label: 'Cache Read Cost',
-          format: 'decimal'
+          label: 'Cache read',
+          format: 'string'
+        },
+        {
+          key: 'cacheWrite',
+          label: 'Cache write',
+          format: 'string'
         }
       ],
       graphs: [

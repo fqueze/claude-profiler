@@ -24,10 +24,61 @@ npm link          # makes the `claude-profiler` command available
 Or run it straight out of the checkout without installing anything:
 
 ```sh
-node /path/to/claude-profiler/index.js <jsonl-file>
+node /path/to/claude-profiler/index.js
 ```
 
+## Quick start
+
+Run it with no arguments. It finds every session on the machine and opens the
+list in a browser, so there is no file to go looking for:
+
+```sh
+claude-profiler
+```
+
+Each row is a session — what it was about, where it ran, when it was last
+active, how long it actually worked, and what it cost — and the **Profiler**
+button on it builds the profile and opens it. Sort by any column to find the
+session worth looking at: the expensive one, the long one, the one with the
+sub-agents.
+
+That is the whole workflow. Everything below is detail.
+
 ## Usage
+
+### The session list
+
+```sh
+claude-profiler
+```
+
+```
+Session list at http://127.0.0.1:64761/
+Press Ctrl+C to stop.
+```
+
+The page is a table of every session under `~/.claude/projects/`, most recently
+active first. A row carries the title Claude Code gave the session, its working
+directory and branch, when it was last active, how much of that time it spent
+working rather than waiting, its message and sub-agent counts, its size on disk
+and what it cost — with a coloured bar banding the cost so the expensive
+sessions are visible without reading the figures.
+
+Clicking a column header sorts by it, so "which session cost the most" and
+"which one ran the most sub-agents" are one click each. The checkbox at the top
+switches the buttons to building [`--size`](#profiling-what-filled-the-context-window)
+profiles instead of timelines.
+
+Profiles are built when a button is clicked rather than up front — a large
+session takes a few seconds — and the server stays up until it is interrupted,
+since the page is a menu rather than a single profile.
+
+Costs are computed for real, including every sub-agent's own API calls, which
+is most of the bill on a session that spawned any.
+
+### A single session
+
+Point it straight at a session file:
 
 ```sh
 claude-profiler ~/.claude/projects/-Users-me-buildgit-myproject/<session-id>.jsonl
@@ -47,17 +98,11 @@ Server started at http://127.0.0.1:60659/
 Opening Firefox Profiler...
 ```
 
-To profile the most recent session of the current project:
-
-```sh
-claude-profiler "$(ls -t ~/.claude/projects/"${PWD//\//-}"/*.jsonl | head -1)"
-```
-
 ### Options
 
 | | |
 |---|---|
-| `--size` | Profile what fills the context window, instead of the session timeline. |
+| `--size` | Profile what fills the context window, instead of the session timeline. With no file given, starts the session list with its checkbox already ticked. |
 | `--at peak\|last` | Which API call's window to profile, with `--size`. Defaults to `peak`. |
 | `--profiler-origin <url>` | Front end to open, and the origin allowed to fetch the profile. Defaults to `https://profiler.firefox.com`, or `$PROFILER_ORIGIN` if set. |
 
@@ -236,7 +281,9 @@ to add a profiler button to each session row.
 
 ## Files
 
-- `index.js` — the CLI and the timeline profile builder.
+- `index.js` — the CLI, the session list server and the timeline profile builder.
+- `session-index.js` — finds and summarizes the sessions, and renders the list
+  page.
 - `context-size.js` — context window reconstruction, calibration and the size
   profile.
 - `size-profile.js` — attribution of bytes to stacks, and the profile tables.
@@ -248,4 +295,5 @@ to add a profiler button to each session row.
   usage objects, sub-agent layout, cost formula and known limitations.
 
 `npm test` covers the shell parsing, the output attribution, the window
-reconstruction, the calibration and the transcript line mapping.
+reconstruction, the calibration, the transcript line mapping and the session
+list.

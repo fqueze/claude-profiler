@@ -1779,6 +1779,11 @@ function createFirefoxProfile(jsonlData, subagents) {
 // front end; a local checkout runs on http://localhost:4242 by default.
 const DEFAULT_PROFILER_ORIGIN = 'https://profiler.firefox.com';
 
+// How many built profiles the session list server holds on to. Enough that
+// going back and forth between a few sessions does not rebuild them, few enough
+// that a long-lived server does not accumulate gigabytes of serialized JSON.
+const PROFILES_KEPT = 4;
+
 function startServer(profileData, profilerOrigin) {
   return new Promise((resolve) => {
     let shutdownRequested = false;
@@ -1873,6 +1878,212 @@ function reportSizeProfile(profile, sizeAt) {
   }
 }
 
+// The server behind the session picker. Unlike startServer, which serves one
+// profile and shuts down as soon as it has been fetched, this one stays up:
+// the page is a menu, and every button on it needs a profile built on demand.
+function startIndexServer(profilerOrigin, options = {}) {
+  const { findSessionFiles, listSessions, renderPage } =
+    require('./session-index.js');
+
+  const deps = {
+    readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
+  };
+
+  // Built once per request rather than cached, so that reloading the page picks
+  // up sessions that have run since it was opened.
+  const sessions = () => listSessions(deps);
+
+  // Profiles are served from the same origin the front end fetches them from,
+  // so each one gets a URL of its own. Insertion order is what makes the oldest
+  // droppable, which a Map preserves.
+  const profiles = new Map();
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+
+    try {
+      if (url.pathname === '/') {
+        return sendHtml(res, renderPage(sessions(), { size: options.size }));
+      }
+
+      if (url.pathname.startsWith('/open/')) {
+        // A malformed escape makes decodeURIComponent throw, which is a bad
+        // request rather than a server fault.
+        let id;
+        try {
+          id = decodeURIComponent(url.pathname.slice('/open/'.length));
+        } catch {
+          return sendJson(res, 400, { error: 'Malformed session id' });
+        }
+
+        // Mapping an id to its file only needs the file list, not the summary
+        // of every session: building those parses every sub-agent transcript,
+        // which is over a second of work to answer a question the filenames
+        // already answer.
+        const session = findSessionFiles().find(
+          (entry) => path.basename(entry.file, '.jsonl') === id
+        );
+        if (!session) {
+          return sendJson(res, 404, { error: `Unknown session ${id}` });
+        }
+
+        const wantsSize = url.searchParams.get('size') === '1';
+        // The file's mtime is part of the key, so that profiling a session
+        // again after working in it some more builds a new profile rather than
+        // serving the one from before: the live session is exactly the one
+        // worth re-profiling.
+        const stamp = fs.statSync(session.file).mtimeMs;
+        const key = `${id}:${wantsSize ? 'size' : 'timeline'}:${stamp}`;
+
+        if (!profiles.has(key)) {
+          // A profile is megabytes of JSON — 52MB for the largest session here
+          // — so only the most recent few are kept. They exist to serve the
+          // fetch that follows the click, not as a cache to accumulate.
+          // Dropped oldest first, leaving room for the one about to be added.
+          while (profiles.size >= PROFILES_KEPT) {
+            profiles.delete(profiles.keys().next().value);
+          }
+          profiles.set(key, buildProfile(session.file, wantsSize, options.at));
+        }
+
+        const { port } = server.address();
+        const profileUrl = `http://127.0.0.1:${port}/profile/${encodeURIComponent(key)}`;
+        return sendJson(res, 200, {
+          url: `${profilerOrigin}/from-url/${encodeURIComponent(profileUrl)}?thread=0`
+        });
+      }
+
+      if (url.pathname.startsWith('/profile/')) {
+        const key = decodeURIComponent(url.pathname.slice('/profile/'.length));
+        const body = profiles.get(key);
+        if (!body) {
+          return sendJson(res, 404, { error: `Unknown profile ${key}` });
+        }
+        return sendProfile(req, res, body, profilerOrigin);
+      }
+
+      sendJson(res, 404, { error: 'Not found' });
+    } catch (error) {
+      console.error(`  ${error.stack}`);
+      sendJson(res, 500, { error: error.message });
+    }
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({ server, serverUrl: `http://127.0.0.1:${server.address().port}/` });
+    });
+  });
+}
+
+// Serializing here rather than at fetch time keeps the profile route cheap and
+// lets a build failure surface on the button that triggered it.
+function buildProfile(file, wantsSize, at = 'peak') {
+  console.log(`Building ${wantsSize ? 'size' : 'timeline'} profile for ${file}`);
+
+  const entries = readJsonlFile(file);
+  const subagents = readSubagents(file);
+
+  let profile;
+  if (wantsSize) {
+    const { createSizeProfile } = require('./context-size.js');
+    profile = createSizeProfile(entries, subagents, { at });
+    // The reporting fields are not part of the profile format.
+    delete profile.tracks;
+    delete profile.totalBytes;
+  } else {
+    profile = createFirefoxProfile(entries, subagents);
+  }
+
+  return Buffer.from(JSON.stringify(profile), 'utf8');
+}
+
+function sendHtml(res, html) {
+  const body = Buffer.from(html, 'utf8');
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': body.length
+  });
+  res.end(body);
+}
+
+function sendJson(res, status, data) {
+  const body = Buffer.from(JSON.stringify(data), 'utf8');
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': body.length
+  });
+  res.end(body);
+}
+
+function sendProfile(req, res, body, profilerOrigin) {
+  // A CORS preflight carries no body and must not be answered with one.
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': profilerOrigin,
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Max-Age': '86400'
+    });
+    return res.end();
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': body.length,
+    'Access-Control-Allow-Origin': profilerOrigin
+  });
+
+  res.end(req.method === 'HEAD' ? undefined : body);
+}
+
+// `claude-profiler` with no file: serve the picker and open it. This does not
+// return — the server has to outlive the request that built the page, so the
+// process runs until it is interrupted.
+async function runSessionIndex(profilerOrigin, options = {}) {
+  // The count is not printed here: the page builds the same list when it is
+  // fetched a moment later, and scanning every session twice is over a second
+  // of work before anything appears.
+  const { serverUrl } = await startIndexServer(profilerOrigin, options);
+  console.log(`Session list at ${serverUrl}`);
+
+  if (!await openUrl(serverUrl)) {
+    console.log(`Please open this URL in a browser: ${serverUrl}`);
+  }
+
+  console.log('Press Ctrl+C to stop.');
+}
+
+// Opens a URL in the browser, which is how both the picker and a profile get
+// in front of the person who asked for them. Resolves to false if the opener
+// could not be run, so the caller can print the URL instead.
+//
+// The failure is asynchronous: a missing opener makes spawn emit 'error' rather
+// than throw, so a try/catch around it never fires — and an 'error' event with
+// no listener is an uncaught exception, which would take the session server
+// down with it on any machine without an xdg-open.
+function openUrl(url) {
+  const command = process.platform === 'darwin' ? 'open' :
+                  process.platform === 'win32' ? 'start' : 'xdg-open';
+
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, [url], { detached: true, stdio: 'ignore' });
+    } catch {
+      return resolve(false);
+    }
+
+    child.on('error', () => resolve(false));
+    // Nothing reports success, so the spawn having got as far as a pid is what
+    // stands in for it; the child is unref'd either way so it cannot hold the
+    // process open.
+    child.on('spawn', () => {
+      child.unref();
+      resolve(true);
+    });
+  });
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
@@ -1899,8 +2110,11 @@ async function main() {
     }
   }
 
-  if (positional.length === 0 || !profilerOrigin) {
-    console.error('Usage: claude-profiler <jsonl-file> [options]');
+  if (!profilerOrigin) {
+    console.error('Usage: claude-profiler [jsonl-file] [options]');
+    console.error('');
+    console.error('With no file, lists every session found under ~/.claude/projects/');
+    console.error('in a browser, to pick one from.');
     console.error('');
     console.error('  --size                  Profile what fills the context window,');
     console.error('                          instead of the session timeline.');
@@ -1908,13 +2122,21 @@ async function main() {
     console.error('                          with --size. Defaults to peak.');
     console.error('  --profiler-origin <url> Front end to open.');
     console.error('');
-    console.error('Example: claude-profiler ~/.claude/projects/my-project/my-session.jsonl');
+    console.error('Example: claude-profiler');
+    console.error('         claude-profiler ~/.claude/projects/my-project/my-session.jsonl');
     process.exit(1);
   }
 
   if (sizeAt !== 'peak' && sizeAt !== 'last') {
     console.error(`Error: --at expects "peak" or "last", got "${sizeAt}"`);
     process.exit(1);
+  }
+
+  // No file named: list the sessions instead and let one be picked from the
+  // browser. The server stays up until it is interrupted, since the page is a
+  // menu that profiles are built from one at a time.
+  if (positional.length === 0) {
+    return runSessionIndex(profilerOrigin, { size: sizeProfile, at: sizeAt });
   }
 
   const filePath = positional[0].startsWith('~')
@@ -1996,5 +2218,10 @@ module.exports = {
 };
 
 if (require.main === module) {
-  main();
+  // The session list branch is not inside main's try/catch — an unreadable
+  // ~/.claude/projects/ should print a message, not an unhandled rejection.
+  main().catch((error) => {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  });
 }

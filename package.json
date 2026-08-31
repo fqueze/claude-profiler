@@ -7,7 +7,7 @@
     "claude-profiler": "./index.js"
   },
   "scripts": {
-    "test": "node test-shell-parse.js && node test-size-profile.js"
+    "test": "node test-shell-parse.js && node test-size-profile.js && node test-session-index.js"
   },
   "keywords": [
     "profiler",
@@ -22,6 +22,7 @@
     "size-profile.js",
     "shell-parse.js",
     "transcript.js",
+    "session-index.js",
     "JSONL_FORMAT.md",
     "README.md"
   ]

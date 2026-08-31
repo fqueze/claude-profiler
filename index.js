@@ -211,6 +211,28 @@ function totalCost(messages) {
   }, 0);
 }
 
+// The prompts a person actually sent, as opposed to everything else the log
+// files under a user role: tool results, interruption notices, the transcript
+// of a slash command and the summary a compaction leaves behind. On a
+// sub-agent's track the first of these is the task it was handed.
+function findUserPrompts(messages) {
+  return messages.filter((msg) => {
+    if (msg.type !== 'user' || msg.message?.role !== 'user') return false;
+    if (msg.isMeta || msg.isCompactSummary || msg.interruptedMessageId) return false;
+
+    const content = msg.message.content;
+    if (Array.isArray(content) && content.some(block => block.type === 'tool_result')) {
+      return false;
+    }
+
+    const text = entryText(msg).trim();
+    return text.length > 0 &&
+      !text.startsWith('<command-') &&
+      !text.startsWith('<local-command-') &&
+      !text.startsWith('[Request interrupted');
+  });
+}
+
 // Groups the assistant entries of one API response together. The response runs
 // from the last thing the model was handed to the last chunk it produced, which
 // covers queueing, inference and streaming — the time nothing else explains.
@@ -280,6 +302,42 @@ function findToolCalls(messages) {
   });
 
   return calls;
+}
+
+// A gap shorter than this is a pause inside a turn — the model handing off to a
+// tool, a tool result being written back — rather than the agent sitting idle.
+const IDLE_THRESHOLD = 2000;
+
+// The stretches where something was actually running: the model thinking, or a
+// tool call in flight. The two overlap, so they are merged — a gap only counts
+// as one when nothing at all was going on. Short gaps stay inside a span: they
+// are pauses within a turn rather than the agent waiting for its user.
+//
+// `end` is where the log stops, for the model response or tool call still in
+// flight when it did.
+function findActivitySpans(messages, end) {
+  const busy = [
+    ...findModelResponses(messages).map(response => ({
+      start: response.start,
+      end: response.end
+    })),
+    ...findToolCalls(messages).map(call => ({
+      start: call.start,
+      end: call.end === null ? end : call.end
+    }))
+  ].filter(span => span.end >= span.start).sort((a, b) => a.start - b.start);
+
+  const spans = [];
+  for (const span of busy) {
+    const last = spans[spans.length - 1];
+    if (last && span.start - last.end <= IDLE_THRESHOLD) {
+      last.end = Math.max(last.end, span.end);
+    } else {
+      spans.push({ ...span });
+    }
+  }
+
+  return spans;
 }
 
 // The part of a tool call worth reading at a glance: what it ran, or on what.
@@ -661,8 +719,8 @@ function buildThread({
     });
   });
 
-  // One cost marker per API call. The token counts ride along in the same
-  // marker: a chart each for output, input, cache reads and cache writes cost
+  // One cost marker per API call, spanning the response it paid for. The token
+  // counts ride along in the same marker: a chart each for output, input, cache reads and cache writes cost
   // four rows of vertical space to say what four lines of one tooltip say, and
   // the cost bars are where one looks for an expensive call anyway.
   const costNameIdx = addString('Cost ($)');
@@ -716,6 +774,42 @@ function buildThread({
       });
     });
   }
+
+  // One marker per stretch of work, and the only thing this track contributes to
+  // the timeline: everything else — the model responses, the tool calls, the
+  // sub-agents — is in the marker chart, and drawing all of it in a strip a few
+  // pixels tall left nothing legible. What the timeline is good for is the
+  // shape of the session, so it gets the question that shape raises: this run
+  // took that long and cost that much, and here is the prompt that asked for
+  // it.
+  const MAX_PROMPT = 300;
+  const activitySpans = findActivitySpans(messages, unregisterTime + startTime);
+  const activityNameIdx = addString('Activity');
+  const prompts = findUserPrompts(messages);
+
+  activitySpans.forEach((span) => {
+    // What the whole stretch cost, whichever calls fell inside it.
+    const cost = apiCalls.reduce(
+      (sum, call) => call.time >= span.start && call.time <= span.end
+        ? sum + call.costs.total
+        : sum,
+      0
+    );
+
+    // The last thing the user said before the agent got to work. Anything they
+    // sent while it was already running belongs to the same stretch, so the
+    // search runs to the end of the span rather than to its start.
+    const prompt = prompts.filter(
+      msg => new Date(msg.timestamp).getTime() <= span.end
+    ).pop();
+    const text = prompt ? entryText(prompt).replace(/\s+/g, ' ') : '';
+
+    addMarker(activityNameIdx, span.start - startTime, span.end - startTime, 1, 1, {
+      type: 'Activity',
+      cost,
+      prompt: text.length > MAX_PROMPT ? `${text.slice(0, MAX_PROMPT)}…` : text
+    });
+  });
 
   // Samples carry what each message added to the context window, so the call
   // tree and the flame graph read like an allocation profile: the stack is what
@@ -828,30 +922,7 @@ function buildThread({
   // measurements shows idle time. The alternative, a threadCPUDelta per sample,
   // would also work but puts a CPU percentage in every tooltip along the
   // timeline, and there is no CPU figure here that would mean anything.
-  const busy = [
-    ...findModelResponses(messages).map(response => ({
-      start: response.start - startTime,
-      end: response.end - startTime
-    })),
-    ...findToolCalls(messages).map(call => ({
-      start: call.start - startTime,
-      // A call with no result was still running when the log ended.
-      end: (call.end === null ? unregisterTime + startTime : call.end) - startTime
-    }))
-  ].filter(span => span.end >= span.start).sort((a, b) => a.start - b.start);
-
-  // Merged, since the model and its tools overlap and a gap only counts when
-  // nothing at all was running.
-  const busySpans = [];
-  for (const span of busy) {
-    const last = busySpans[busySpans.length - 1];
-    if (last && span.start <= last.end) {
-      last.end = Math.max(last.end, span.end);
-    } else {
-      busySpans.push({ ...span });
-    }
-  }
-
+  //
   // Two samples per gap are enough. The graph gives a sample the span from
   // halfway back to the previous sample to halfway on to the next, and fills it
   // with that sample's own category — so one at each end of a gap covers all of
@@ -872,15 +943,15 @@ function buildThread({
     }
   }
 
-  // Gaps between busy stretches, plus the head and tail of the track. Short
-  // gaps are left alone: they are pauses within a turn rather than waiting.
-  const IDLE_THRESHOLD = 2000;
+  // Gaps between the stretches of work, plus the head and tail of the track.
+  // The spans have already absorbed the gaps too short to count.
   let cursor = registerTime;
-  for (const span of busySpans) {
-    if (span.start - cursor > IDLE_THRESHOLD) {
-      markIdle(cursor, span.start);
+  for (const span of activitySpans) {
+    const start = span.start - startTime;
+    if (start - cursor > IDLE_THRESHOLD) {
+      markIdle(cursor, start);
     }
-    cursor = Math.max(cursor, span.end);
+    cursor = Math.max(cursor, span.end - startTime);
   }
   if (unregisterTime - cursor > IDLE_THRESHOLD) {
     markIdle(cursor, unregisterTime);
@@ -1160,7 +1231,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       tooltipLabel: '{marker.data.model}',
       tableLabel: '{marker.data.model} ({marker.data.stopReason})',
       chartLabel: '{marker.data.stopReason}',
-      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      display: ['marker-chart', 'marker-table'],
       fields: [
         {
           key: 'model',
@@ -1218,7 +1289,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       tooltipLabel: '{marker.data.kind}',
       tableLabel: '{marker.name}: {marker.data.kind}',
       chartLabel: '{marker.data.kind}',
-      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      display: ['marker-chart', 'marker-table'],
       fields: [
         {
           key: 'kind',
@@ -1237,7 +1308,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       tooltipLabel: '{marker.data.name}',
       tableLabel: '{marker.data.name} — {marker.data.detail}',
       chartLabel: '{marker.data.detail}',
-      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      display: ['marker-chart', 'marker-table'],
       fields: [
         {
           key: 'detail',
@@ -1261,7 +1332,7 @@ function createFirefoxProfile(jsonlData, subagents) {
       tooltipLabel: '{marker.data.description}',
       tableLabel: '{marker.data.agentType}: {marker.data.description}',
       chartLabel: '{marker.data.description}',
-      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      display: ['marker-chart', 'marker-table'],
       fields: [
         {
           key: 'description',
@@ -1282,6 +1353,25 @@ function createFirefoxProfile(jsonlData, subagents) {
           key: 'cost',
           label: 'Cost ($)',
           format: 'decimal'
+        }
+      ]
+    },
+    {
+      name: 'Activity',
+      tooltipLabel: '{marker.name}',
+      tableLabel: '{marker.name} — {marker.data.prompt}',
+      chartLabel: '{marker.data.prompt}',
+      display: ['marker-chart', 'marker-table', 'timeline-overview'],
+      fields: [
+        {
+          key: 'cost',
+          label: 'Cost ($)',
+          format: 'decimal'
+        },
+        {
+          key: 'prompt',
+          label: 'Prompt',
+          format: 'string'
         }
       ]
     },

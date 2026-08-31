@@ -164,15 +164,23 @@ function cumulativeCostFields(totalLabel) {
 //
 // This is the shape mach's resource monitor uses for its CPU chart, which stacks
 // the same way.
-function costGraphs(type) {
+//
+// Bars rather than filled lines, even for the cumulative charts. A filled line
+// is painted at 53% alpha, and since every band is drawn down to the baseline
+// the lower ones show through all the bands above them: cache read came out a
+// muddy #698189 instead of blue, cache write a khaki #bfa23a, and none of the
+// four looked like the colour it stood for. Bars fill with the stroke colour
+// itself, so a band is the colour it is named after in every chart.
+function costGraphs() {
   return [
     ...[...COST_PARTS].reverse().map(part => ({
       key: stackKey(part),
       color: part.color,
-      type
+      type: 'bar'
     })),
-    // Last, so it is bottom-most, and only there to hold the scale at zero.
-    { key: ZERO_BAND, color: 'grey', type }
+    // Last, so it is bottom-most. Bars scale from zero, so this is only kept for
+    // the tooltip's sake — a band of height zero is not drawn.
+    { key: ZERO_BAND, color: 'grey', type: 'bar' }
   ];
 }
 
@@ -1546,21 +1554,21 @@ function createFirefoxProfile(jsonlData, subagents) {
         ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true })),
         { key: ZERO_BAND, hidden: true }
       ],
-      graphs: costGraphs('bar')
+      graphs: costGraphs()
     },
     {
       name: 'AgentCost',
       tooltipLabel: '{marker.name}',
       display: [],
       fields: cumulativeCostFields('Agent Cost (cumulative)'),
-      graphs: costGraphs('line-filled')
+      graphs: costGraphs()
     },
     {
       name: 'TotalCost',
       tooltipLabel: '{marker.name}',
       display: [],
       fields: cumulativeCostFields('Total Cost'),
-      graphs: costGraphs('line-filled')
+      graphs: costGraphs()
     }
   ];
 

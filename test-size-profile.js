@@ -556,10 +556,14 @@ check('the cumulative charts colour the parts as the per-call one does',
   colorsFor('AgentCost'), colorsFor('Cost'));
 check('both cumulative charts agree', colorsFor('TotalCost'), colorsFor('AgentCost'));
 
-// The cumulative charts are filled areas rather than bare lines.
-check('the cumulative charts are filled',
-  costSchemas.filter(schema => schema.name !== 'Cost')
-    .every(schema => schema.graphs.every(graph => graph.type === 'line-filled')), true);
+// Filled areas rather than bare lines, and bars rather than filled lines: a
+// filled line is painted at 53% alpha over every band beneath it, which turned
+// cache read into a muddy grey-teal instead of blue. Bars fill with the colour
+// itself, so a band looks like the colour it is named after.
+check('every cost chart is drawn as filled bars',
+  costSchemas.every(schema => schema.graphs.every(graph => graph.type === 'bar')), true);
+check('no cost chart is a bare line',
+  costSchemas.every(schema => schema.graphs.every(graph => graph.type !== 'line')), true);
 
 // A marker missing any key its chart names is dropped from that chart, so every
 // part gets a number even when it cost nothing.

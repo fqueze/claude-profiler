@@ -75,7 +75,6 @@ function calculateCost(usage, pricing) {
 
 // Indexes into the timeline profile's category list below. Idle is drawn as
 // nothing, so an idle stretch reads as empty rather than as another kind of work.
-const OTHER_CATEGORY = 0;
 const MESSAGES_CATEGORY = 1;
 const TOOLS_CATEGORY = 3;
 const MODEL_CATEGORY = 5;
@@ -210,9 +209,11 @@ const CONTEXT_PARTS = [
   { key: 'unlogged', label: 'System prompt + tool schemas (not logged)', color: 'grey' },
   { key: 'messages', label: 'Messages', color: 'blue', category: MESSAGES_CATEGORY },
   { key: 'tools', label: 'Tools', color: 'green', category: TOOLS_CATEGORY },
-  { key: 'model', label: 'Model', color: 'purple', category: MODEL_CATEGORY },
-  { key: 'other', label: 'Other', color: 'ink', category: OTHER_CATEGORY }
+  { key: 'model', label: 'Model', color: 'purple', category: MODEL_CATEGORY }
 ];
+// No catch-all among them: the mapping below attributes every byte to whoever
+// produced it, so a band for the timeline's `Other` category would have been a
+// row of `Other 0B` in every tooltip and a band that never drew.
 
 function contextBreakdowns(entries, apiCalls) {
   const byUuid = new Map();
@@ -808,7 +809,9 @@ function sizeCategoryToTimeline(category, role) {
     case CATEGORY['User text']: return MESSAGES_CATEGORY;
     case CATEGORY['Injected context']: return MESSAGES_CATEGORY;
     // Whatever else a message holds, the agent was busy with it: a tool result
-    // is the tool, and anything the model sent is the model.
+    // is the tool, and anything the model sent is the model. Nothing is left
+    // for the timeline's `Other` category, which is why the context chart has
+    // no band for it.
     default: return role === 'assistant' ? MODEL_CATEGORY : TOOLS_CATEGORY;
   }
 }

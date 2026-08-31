@@ -531,21 +531,36 @@ function sourceSlug(label) {
   return (cleaned || 'session').slice(0, 60);
 }
 
-// Index into the timeline profile's category list below. Drawn as nothing, so an
-// idle stretch reads as empty rather than as another kind of work.
+// Indexes into the timeline profile's category list below. Idle is drawn as
+// nothing, so an idle stretch reads as empty rather than as another kind of work.
+const MESSAGES_CATEGORY = 1;
+const TOOLS_CATEGORY = 3;
+const MODEL_CATEGORY = 5;
 const IDLE_CATEGORY = 6;
 
 // The size profile has its own category list; the timeline profile's is about
 // what happened rather than where bytes came from, so they are mapped over.
-function sizeCategoryToTimeline(category) {
+//
+// The size profile sorts bytes by what kind of content they are, which is not
+// the same question: it files an `echo` separator printed by a Bash call under
+// `Other`, because it is not output worth reading, and a thinking block under
+// `Other` too, because only its signature survives. Along a timeline both of
+// those are something running — the tool call and the model — and a category of
+// their own painted the middle of a long call grey, since a call's bytes all
+// land on the one moment its result was logged and the graph fills the space
+// between two samples from the nearer one. So anything the mapping does not
+// recognise is attributed to whoever produced it.
+function sizeCategoryToTimeline(category, role) {
   const { CATEGORY } = require('./size-profile.js');
   switch (category) {
-    case CATEGORY['Tool output']: return 3;      // Tools
-    case CATEGORY['Tool call']: return 3;        // Tools
-    case CATEGORY['Assistant text']: return 5;   // Model
-    case CATEGORY['User text']: return 1;        // Messages
-    case CATEGORY['Injected context']: return 1; // Messages
-    default: return 0;                           // Other
+    case CATEGORY['Tool output']: return TOOLS_CATEGORY;
+    case CATEGORY['Tool call']: return TOOLS_CATEGORY;
+    case CATEGORY['Assistant text']: return MODEL_CATEGORY;
+    case CATEGORY['User text']: return MESSAGES_CATEGORY;
+    case CATEGORY['Injected context']: return MESSAGES_CATEGORY;
+    // Whatever else a message holds, the agent was busy with it: a tool result
+    // is the tool, and anything the model sent is the model.
+    default: return role === 'assistant' ? MODEL_CATEGORY : TOOLS_CATEGORY;
   }
 }
 
@@ -902,9 +917,10 @@ function buildThread({
 
   messages.forEach((msg) => {
     const relativeTime = new Date(msg.timestamp).getTime() - startTime;
+    const role = msg.message?.role || msg.type;
     attributeEntry(msg, toolUses, (frames, category, bytes, line, leafLabel) => {
       if (bytes <= 0) return;
-      const stackIndex = addStack(frames, sizeCategoryToTimeline(category), line, leafLabel);
+      const stackIndex = addStack(frames, sizeCategoryToTimeline(category, role), line, leafLabel);
       if (stackIndex === null) return;
       sampleStacks.push(stackIndex);
       sampleTimes.push(relativeTime);

@@ -419,6 +419,110 @@ for (let index = 0; index < idleThread.samples.length; index++) {
 }
 check('no idle sample lands inside the opening exchange', idleDuringWork, 0);
 
+// Every byte a call contributes lands on the moment its result was logged, so a
+// long call has a sample at each end and nothing in between, and the graph fills
+// the space between two samples from the nearer one. That makes each sample's own
+// category responsible for a stretch of timeline either side of it — so an `echo`
+// separator, which the size profile files under `Other` because it is not output
+// worth reading, painted half of a two-minute test run grey.
+//
+// The fix is in the categories, not in extra samples: a zero-weight sample with a
+// one-frame stack would colour the strip, but it is also what the timeline selects
+// when clicked, and it has no transcript line and nothing to show in the call
+// tree. Every sample here stays a real one, carrying the bytes and the stack that
+// produced them.
+const longCallCase = [
+  { uuid: 'L1', parentUuid: null, type: 'user', timestamp: '2026-01-01T00:00:00.000Z',
+    promptSource: 'typed', message: { role: 'user', content: 'run the tests' } },
+  { uuid: 'L2', parentUuid: 'L1', type: 'assistant', requestId: 'r1',
+    timestamp: '2026-01-01T00:00:02.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5',
+      usage: { input_tokens: 10, output_tokens: 5 },
+      content: [{ type: 'tool_use', id: 'tc1', name: 'Bash',
+        input: { command: 'echo ---- ; ./mach test' } }] } },
+  // Two minutes later: the result, an echo separator and the real output.
+  { uuid: 'L3', parentUuid: 'L2', type: 'user', timestamp: '2026-01-01T00:02:02.000Z',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tc1',
+      content: '----\nTEST-PASS | everything fine\n' }] } },
+  { uuid: 'L4', parentUuid: 'L3', type: 'assistant', requestId: 'r2',
+    timestamp: '2026-01-01T00:02:04.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5',
+      usage: { input_tokens: 20, output_tokens: 5 },
+      content: [{ type: 'tool_use', id: 'tc2', name: 'Bash',
+        input: { command: 'echo ==== ; ./mach test --verify' } }] } },
+  // A second long call, so the first one's `echo` separator lands inside a call
+  // rather than at the very end of the track.
+  { uuid: 'L5', parentUuid: 'L4', type: 'user', timestamp: '2026-01-01T00:04:04.000Z',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tc2',
+      content: '====\nTEST-PASS | still fine\n' }] } },
+  { uuid: 'L6', parentUuid: 'L5', type: 'assistant', requestId: 'r3',
+    timestamp: '2026-01-01T00:04:06.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5',
+      usage: { input_tokens: 30, output_tokens: 5 },
+      content: [{ type: 'text', text: 'tests passed' }] } }
+];
+
+const longCall = createFirefoxProfile(longCallCase, []);
+const longThread = longCall.threads[0];
+const toolsCategory = longCall.meta.categories.findIndex(c => c.name === 'Tools');
+const longCategoryOf = (index) =>
+  longCall.shared.frameTable.category[
+    longCall.shared.stackTable.frame[longThread.samples.stack[index]]];
+const idleCategoryOfLongCall = longCall.meta.categories.findIndex(c => c.name === 'Idle');
+
+// The call ran from 2s to 122s. Its own ends are shared with the model response
+// on either side — the model stopped for the tool and resumed after it — so what
+// has to read as the tool is the interior.
+const inCall = [];
+for (let index = 0; index < longThread.samples.length; index++) {
+  const time = longThread.samples.time[index];
+  if (time >= 2000 && time < 122000) inCall.push(longCategoryOf(index));
+}
+
+check('a long call has samples to colour it', inCall.length > 0, true);
+check('every sample inside a long call reads as a tool running',
+  inCall.every(category => category === toolsCategory), true);
+
+// Clicking the timeline selects the sample at that point, so every sample has to
+// be one worth selecting: a real stack, with the bytes it accounts for. A
+// colour-only sample would be picked just as often and would show nothing.
+let weightless = 0;
+for (let index = 0; index < longThread.samples.length; index++) {
+  if (longThread.samples.weight[index] === 0 &&
+      longCategoryOf(index) !== idleCategoryOfLongCall) {
+    weightless++;
+  }
+}
+check('no weightless samples outside idle', weightless, 0);
+
+// The `echo` separator is logged at the instant the result arrives, which is the
+// instant the call ends, so it never lands in a call's interior — what it can do
+// is colour the half of the call nearest to it. Along a timeline there is no such
+// thing as a byte that arrived while nothing was happening, so no sample may
+// fall in the catch-all category at all.
+const otherCategory = longCall.meta.categories.findIndex(c => c.name === 'Other');
+const otherSamples = [];
+for (let index = 0; index < longThread.samples.length; index++) {
+  if (longCategoryOf(index) === otherCategory) {
+    otherSamples.push(longThread.samples.time[index]);
+  }
+}
+check('nothing along the timeline is filed as Other', otherSamples, []);
+
+// The call tree measures the bytes the conversation actually holds, and nothing
+// the timeline does for its own sake may inflate them.
+let longWeight = 0;
+for (let index = 0; index < longThread.samples.length; index++) {
+  longWeight += longThread.samples.weight[index];
+}
+const bytesInCase = longCallCase.reduce((sum, entry) => {
+  const content = entry.message?.content;
+  return sum + (typeof content === 'string'
+    ? Buffer.byteLength(content)
+    : Buffer.byteLength(JSON.stringify(content)));
+}, 0);
+check('the weights are still just the conversation', longWeight < bytesInCase, true);
+
 // The size profile measures bytes, not wall clock, so it has no idle to show.
 check('the size profile has no Idle category',
   built.meta.categories.some(c => c.name === 'Idle'), false);

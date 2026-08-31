@@ -73,6 +73,92 @@ function calculateCost(usage, pricing) {
   };
 }
 
+// A running total that keeps the four parts of a cost as well as their sum, so
+// the cumulative graphs can be stacked by what the money went on rather than
+// drawn as one line. Each `add` returns the totals as of that call, which is
+// what the marker at that point reports.
+class RunningCost {
+  constructor() {
+    this.sums = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  }
+
+  add(costs) {
+    for (const part of Object.keys(this.sums)) {
+      this.sums[part] += costs[part];
+    }
+    return { ...this.sums, total: this.total() };
+  }
+
+  total() {
+    return Object.values(this.sums).reduce((sum, value) => sum + value, 0);
+  }
+}
+
+// The four things an API call is billed for, in the order they are stacked and
+// the colour each keeps in every chart that shows cost. One colour per part
+// throughout means a spike on the Cost chart can be followed into the
+// cumulative ones: the band that jumped is the band that grew.
+const COST_PARTS = [
+  { key: 'cacheRead', label: 'Cache read', color: 'blue' },
+  { key: 'cacheWrite', label: 'Cache write', color: 'orange' },
+  { key: 'input', label: 'Input', color: 'green' },
+  { key: 'output', label: 'Output', color: 'purple' }
+];
+
+// The numbers a stacked cost chart plots. The front end draws every graph entry
+// from the bottom of the canvas independently — there is no stacking of one
+// entry on the next — so the bands have to be stacked here: each is the sum of
+// its own part and every part below it. Drawn largest first, the smaller fills
+// land on top and each band's visible height is its own share.
+//
+// Every key a graph names has to be present on every marker or the marker is
+// dropped from the chart, so a part that cost nothing still gets its 0.
+function stackedCost(costs) {
+  const data = {};
+  let running = 0;
+  for (const part of COST_PARTS) {
+    running += costs[part.key] || 0;
+    data[stackKey(part)] = running;
+  }
+  return data;
+}
+
+function stackKey(part) {
+  return `${part.key}Stacked`;
+}
+
+// What a cumulative chart's tooltip says: the running total, then what each part
+// of it has come to. The stacked keys the bands are drawn from are subtotals and
+// would read as nonsense, so the tooltip is given the parts themselves.
+function cumulativeCost(totals) {
+  const data = { total: totals.total, ...stackedCost(totals) };
+  for (const part of COST_PARTS) {
+    data[part.key] = totals[part.key];
+  }
+  return data;
+}
+
+function cumulativeCostFields(totalLabel) {
+  return [
+    { key: 'total', label: totalLabel, format: 'decimal' },
+    ...COST_PARTS.map(part => ({ key: part.key, label: part.label, format: 'decimal' })),
+    // Drawn, not read: the bands come from these.
+    ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true }))
+  ];
+}
+
+// The bands of a cost chart, biggest first: the topmost is the full total, and
+// each one after it cuts away the part above. Same colour per part in every
+// chart, so a spike on the Cost chart is the band that grows on the cumulative
+// ones.
+function costGraphs(type) {
+  return [...COST_PARTS].reverse().map(part => ({
+    key: stackKey(part),
+    color: part.color,
+    type
+  }));
+}
+
 // One line of a cost breakdown: what that part of a call cost and how many
 // tokens bought it. A string rather than two fields, so the tooltip reads as
 // four lines instead of eight, and empty when nothing was billed — a call with
@@ -762,17 +848,22 @@ function buildThread({
       addMarker(costNameIdx, start - startTime, relativeTime, 1, 1, {
         type: 'Cost',
         cost: costs.total,
+        // The tooltip rows read as text, since each is a cost and the tokens
+        // that bought it; the bands need the bare numbers, under keys of their
+        // own so one marker can serve both.
         output: costWithTokens(costs.output, usage.output_tokens),
         input: costWithTokens(costs.input, usage.input_tokens),
         cacheRead: costWithTokens(costs.cacheRead, usage.cache_read_input_tokens),
-        cacheWrite: costWithTokens(costs.cacheWrite, usage.cache_creation_input_tokens)
+        cacheWrite: costWithTokens(costs.cacheWrite, usage.cache_creation_input_tokens),
+        ...stackedCost(costs)
       });
     }
 
-    // Running total of what this agent has spent so far.
+    // Running total of what this agent has spent so far, split by what the
+    // money went on.
     addMarker(agentCostNameIdx, relativeTime, relativeTime, 0, 1, {
       type: 'AgentCost',
-      total: agentCost
+      ...cumulativeCost(agentCost)
     });
   });
 
@@ -785,7 +876,7 @@ function buildThread({
       const relativeTime = time - startTime;
       addMarker(totalCostNameIdx, relativeTime, relativeTime, 0, 1, {
         type: 'TotalCost',
-        total
+        ...cumulativeCost(total)
       });
     });
   }
@@ -1096,22 +1187,18 @@ function createFirefoxProfile(jsonlData, subagents) {
       };
     });
 
-    let agentCost = 0;
+    const running = new RunningCost();
     track.apiCalls.forEach((call) => {
-      agentCost += call.costs.total;
-      call.agentCost = agentCost;
+      call.agentCost = running.add(call.costs);
     });
-    track.cost = agentCost;
+    track.cost = running.total();
   });
 
-  let sessionCost = 0;
+  const sessionCost = new RunningCost();
   const totalCostPoints = tracks
     .flatMap(track => track.apiCalls)
     .sort((a, b) => a.time - b.time)
-    .map((call) => {
-      sessionCost += call.costs.total;
-      return { time: call.time, total: sessionCost };
-    });
+    .map(call => ({ time: call.time, total: sessionCost.add(call.costs) }));
 
   // A sub-agent is listed on whichever track made the Task/Agent tool call its
   // meta.json points at, so nested agents show up on their spawner's track.
@@ -1437,41 +1524,25 @@ function createFirefoxProfile(jsonlData, subagents) {
           key: 'cacheWrite',
           label: 'Cache write',
           format: 'string'
-        }
+        },
+        // Drawn, not read: the bands come from these.
+        ...COST_PARTS.map(part => ({ key: stackKey(part), hidden: true }))
       ],
-      graphs: [
-        { key: 'cost', color: 'red', type: 'bar' }
-      ]
+      graphs: costGraphs('bar')
     },
     {
       name: 'AgentCost',
       tooltipLabel: '{marker.name}',
       display: [],
-      fields: [
-        {
-          key: 'total',
-          label: 'Agent Cost (cumulative)',
-          format: 'decimal'
-        }
-      ],
-      graphs: [
-        { key: 'total', color: 'red', type: 'line' }
-      ]
+      fields: cumulativeCostFields('Agent Cost (cumulative)'),
+      graphs: costGraphs('line-filled')
     },
     {
       name: 'TotalCost',
       tooltipLabel: '{marker.name}',
       display: [],
-      fields: [
-        {
-          key: 'total',
-          label: 'Total Cost',
-          format: 'decimal'
-        }
-      ],
-      graphs: [
-        { key: 'total', color: 'magenta', type: 'line' }
-      ]
+      fields: cumulativeCostFields('Total Cost'),
+      graphs: costGraphs('line-filled')
     }
   ];
 

@@ -523,6 +523,107 @@ const bytesInCase = longCallCase.reduce((sum, entry) => {
 }, 0);
 check('the weights are still just the conversation', longWeight < bytesInCase, true);
 
+// The cost charts are stacked bands of the four things a call is billed for. The
+// front end draws each graph entry from the bottom of the canvas on its own — it
+// does not stack one on the next — so the stacking is done here, each band being
+// its own part plus everything below it, declared largest first so the smaller
+// fills land on top.
+const costSchemas = withIdle.meta.markerSchema.filter(schema =>
+  ['Cost', 'AgentCost', 'TotalCost'].includes(schema.name));
+check('all three cost charts are graphed', costSchemas.length, 3);
+
+// Only these ten colours exist, and only these three types; anything else throws
+// at draw time in the front end rather than degrading.
+const GRAPH_COLORS = ['blue', 'green', 'grey', 'ink', 'magenta', 'orange',
+  'purple', 'red', 'teal', 'yellow'];
+const GRAPH_TYPES = ['bar', 'line', 'line-filled'];
+const badGraphs = [];
+for (const schema of withIdle.meta.markerSchema) {
+  for (const graph of schema.graphs || []) {
+    if (!GRAPH_TYPES.includes(graph.type)) badGraphs.push(`${schema.name}: ${graph.type}`);
+    if (graph.color && !GRAPH_COLORS.includes(graph.color)) {
+      badGraphs.push(`${schema.name}: ${graph.color}`);
+    }
+  }
+}
+check('every graph uses a type and colour the front end knows', badGraphs, []);
+
+// One colour per part in every chart, so a spike on the Cost chart can be
+// followed into the cumulative ones.
+const colorsFor = (name) => (costSchemas.find(schema => schema.name === name).graphs)
+  .map(graph => `${graph.key}:${graph.color}`).join(' ');
+check('the cumulative charts colour the parts as the per-call one does',
+  colorsFor('AgentCost'), colorsFor('Cost'));
+check('both cumulative charts agree', colorsFor('TotalCost'), colorsFor('AgentCost'));
+
+// The cumulative charts are filled areas rather than bare lines.
+check('the cumulative charts are filled',
+  costSchemas.filter(schema => schema.name !== 'Cost')
+    .every(schema => schema.graphs.every(graph => graph.type === 'line-filled')), true);
+
+// A marker missing any key its chart names is dropped from that chart, so every
+// part gets a number even when it cost nothing.
+const bandsOf = (schema) => schema.graphs.map(graph => graph.key);
+const droppedMarkers = [];
+const unstackedBands = [];
+for (const schema of costSchemas) {
+  const keys = bandsOf(schema);
+  for (let index = 0; index < idleThread.markers.length; index++) {
+    const data = idleThread.markers.data[index];
+    if (!data || data.type !== schema.name) continue;
+    if (!keys.every(key => key in data)) droppedMarkers.push(schema.name);
+    // Declared largest first, so read back to front to walk up the stack.
+    const rising = [...keys].reverse().map(key => data[key]);
+    for (let band = 1; band < rising.length; band++) {
+      if (rising[band] < rising[band - 1]) unstackedBands.push(schema.name);
+    }
+  }
+}
+check('no cost marker is missing a band', droppedMarkers, []);
+check('the bands rise from the bottom of the stack', unstackedBands, []);
+
+// A call billed mostly for output, so the parts are nowhere near ascending order:
+// stacked they still have to rise, which is what catches bands emitted as raw
+// per-part values rather than as subtotals.
+const outputHeavy = createFirefoxProfile([
+  { uuid: 'o1', parentUuid: null, type: 'user', timestamp: '2026-01-01T00:00:00.000Z',
+    promptSource: 'typed', message: { role: 'user', content: 'write it all out' } },
+  { uuid: 'o2', parentUuid: 'o1', type: 'assistant', requestId: 'r1',
+    timestamp: '2026-01-01T00:00:02.000Z',
+    message: { role: 'assistant', model: 'claude-opus-5',
+      usage: { input_tokens: 5, output_tokens: 9000,
+        cache_read_input_tokens: 10, cache_creation_input_tokens: 20 },
+      content: [{ type: 'text', text: 'ok' }] } }
+], []);
+
+const heavyBands = [];
+const heavySchema = outputHeavy.meta.markerSchema.find(schema => schema.name === 'TotalCost');
+for (let index = 0; index < outputHeavy.threads[0].markers.length; index++) {
+  const data = outputHeavy.threads[0].markers.data[index];
+  if (!data || data.type !== 'TotalCost') continue;
+  const rising = [...heavySchema.graphs].reverse().map(graph => data[graph.key]);
+  for (let band = 1; band < rising.length; band++) {
+    if (rising[band] < rising[band - 1]) heavyBands.push(rising);
+  }
+}
+check('an output-heavy call still stacks in rising order', heavyBands, []);
+
+// The top band is the whole of what was spent, and the parts the tooltip shows
+// add up to the same figure.
+let checkedTotals = 0;
+const wrongTotals = [];
+for (let index = 0; index < idleThread.markers.length; index++) {
+  const data = idleThread.markers.data[index];
+  if (!data || data.type !== 'TotalCost') continue;
+  checkedTotals++;
+  const top = data[bandsOf(costSchemas.find(s => s.name === 'TotalCost'))[0]];
+  if (Math.abs(top - data.total) > 1e-9) wrongTotals.push('top band');
+  const parts = data.output + data.input + data.cacheRead + data.cacheWrite;
+  if (Math.abs(parts - data.total) > 1e-9) wrongTotals.push('parts');
+}
+check('there are cumulative markers to check', checkedTotals > 0, true);
+check('the top band and the parts both come to the total', wrongTotals, []);
+
 // The size profile measures bytes, not wall clock, so it has no idle to show.
 check('the size profile has no Idle category',
   built.meta.categories.some(c => c.name === 'Idle'), false);

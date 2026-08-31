@@ -853,7 +853,7 @@ function buildThread({
   const agentCostNameIdx = addString('Agent Cost ($)');
   const contextSizeNameIdx = addString('Context Size');
 
-  apiCalls.forEach(({ msg, costs, agentCost, start, time }) => {
+  apiCalls.forEach(({ msg, costs, agentCost, start, time }, index) => {
     const usage = msg.message.usage;
     const relativeTime = time - startTime;
 
@@ -885,11 +885,21 @@ function buildThread({
     }
 
     // Running total of what this agent has spent so far, split by what the
-    // money went on.
-    addMarker(agentCostNameIdx, relativeTime, relativeTime, 0, 1, {
-      type: 'AgentCost',
-      ...cumulativeCost(agentCost)
-    });
+    // money went on. An interval holding that figure until the next call moves
+    // it: a bar is only as wide as the marker it comes from, so a point would
+    // draw as a one pixel spike instead of a step in a staircase.
+    addMarker(
+      agentCostNameIdx,
+      relativeTime,
+      (index + 1 < apiCalls.length ? apiCalls[index + 1].time : unregisterTime + startTime) -
+        startTime,
+      1,
+      1,
+      {
+        type: 'AgentCost',
+        ...cumulativeCost(agentCost)
+      }
+    );
   });
 
   // The session-wide total only goes on the parent track, but it is sampled at
@@ -897,9 +907,11 @@ function buildThread({
   // staircase between the parent's own calls.
   if (totalCostPoints) {
     const totalCostNameIdx = addString('Total Cost ($)');
-    totalCostPoints.forEach(({ time, total }) => {
-      const relativeTime = time - startTime;
-      addMarker(totalCostNameIdx, relativeTime, relativeTime, 0, 1, {
+    totalCostPoints.forEach(({ time, total }, index) => {
+      const next = index + 1 < totalCostPoints.length
+        ? totalCostPoints[index + 1].time
+        : unregisterTime + startTime;
+      addMarker(totalCostNameIdx, time - startTime, next - startTime, 1, 1, {
         type: 'TotalCost',
         ...cumulativeCost(total)
       });

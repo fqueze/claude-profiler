@@ -565,6 +565,29 @@ check('every cost chart is drawn as filled bars',
 check('no cost chart is a bare line',
   costSchemas.every(schema => schema.graphs.every(graph => graph.type !== 'line')), true);
 
+// A bar is only as wide as the marker it comes from — `x2 = marker.end ? ... :
+// x + 1` — so a running total emitted as a point draws as a one pixel spike
+// instead of a step in a staircase. Each cumulative marker has to hold its
+// figure until the next call moves it, leaving no gap.
+for (const name of ['AgentCost', 'TotalCost']) {
+  const intervals = [];
+  for (let index = 0; index < idleThread.markers.length; index++) {
+    if (idleThread.markers.data[index]?.type !== name) continue;
+    intervals.push([idleThread.markers.startTime[index], idleThread.markers.endTime[index]]);
+  }
+  intervals.sort((a, b) => a[0] - b[0]);
+
+  // The last one runs to the end of the track, which it may already sit on.
+  const widthless = intervals.slice(0, -1).filter(([start, end]) => end <= start);
+  check(`${name} bars have a width`, widthless, []);
+
+  const gaps = [];
+  for (let index = 1; index < intervals.length; index++) {
+    if (intervals[index][0] !== intervals[index - 1][1]) gaps.push(intervals[index][0]);
+  }
+  check(`${name} is a staircase with no gaps`, gaps, []);
+}
+
 // A marker missing any key its chart names is dropped from that chart, so every
 // part gets a number even when it cost nothing.
 const bandsOf = (schema) => schema.graphs.map(graph => graph.key);

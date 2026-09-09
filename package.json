@@ -1,13 +1,13 @@
 {
   "name": "claude-profiler",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CLI tool to open Firefox profiler with Claude conversation data",
   "main": "index.js",
   "bin": {
     "claude-profiler": "./index.js"
   },
   "scripts": {
-    "test": "node test-shell-parse.js && node test-size-profile.js && node test-session-index.js"
+    "test": "node test-shell-parse.js && node test-size-profile.js && node test-session-index.js && node test-remote.js"
   },
   "keywords": [
     "profiler",
@@ -23,6 +23,7 @@
     "shell-parse.js",
     "transcript.js",
     "session-index.js",
+    "remote.js",
     "JSONL_FORMAT.md",
     "README.md"
   ]

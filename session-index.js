@@ -348,7 +348,7 @@ const COLUMNS = [
   { label: '', className: 'action', unsortable: true }
 ];
 
-function renderPage(sessions, { size = false } = {}) {
+function renderPage(sessions, { size = false, host = null } = {}) {
   const header = COLUMNS.map((column, i) =>
     column.unsortable
       ? `<th class="${column.className}"></th>`
@@ -363,7 +363,7 @@ function renderPage(sessions, { size = false } = {}) {
 
   return `<!DOCTYPE html>
 <meta charset="utf-8">
-<title>Claude sessions</title>
+<title>Claude sessions${host ? ` on ${escapeHtml(host)}` : ''}</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -484,9 +484,13 @@ function renderPage(sessions, { size = false } = {}) {
   button:disabled { animation: pulse 1s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .35; } }
   .empty { color: var(--dim); padding: 2rem 0; }
+  /* The machine being looked at, when it is not this one. Worth saying in the
+     heading rather than in small print: every figure on the page is about that
+     machine, and a tab left open is easy to mistake for the local list. */
+  h1 .host { color: var(--accent); }
 </style>
 
-<h1>Claude sessions</h1>
+<h1>Claude sessions${host ? ` on <span class="host">${escapeHtml(host)}</span>` : ''}</h1>
 <div class="summary">
   <strong>${sessions.length}</strong> session${sessions.length === 1 ? '' : 's'} ·
   <strong>${formatBytes(totalBytes)}</strong> ·
@@ -509,7 +513,7 @@ function renderPage(sessions, { size = false } = {}) {
 </div>
 
 ${sessions.length === 0
-  ? '<p class="empty">No sessions found under ~/.claude/projects/.</p>'
+  ? `<p class="empty">No sessions found under ~/.claude/projects/${host ? ` on ${escapeHtml(host)}` : ''}.</p>`
   : `<div class="scroll"><table>
   <thead><tr>${header}</tr></thead>
   ${sessions.map(session => sessionRow(session, maxCost)).join('')}

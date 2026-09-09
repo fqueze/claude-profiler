@@ -1878,20 +1878,90 @@ function reportSizeProfile(profile, sizeAt) {
   }
 }
 
-// The server behind the session picker. Unlike startServer, which serves one
-// profile and shuts down as soon as it has been fetched, this one stays up:
-// the page is a menu, and every button on it needs a profile built on demand.
-function startIndexServer(profilerOrigin, options = {}) {
-  const { findSessionFiles, listSessions, renderPage } =
-    require('./session-index.js');
-
+// What `--json` answers with, for a claude-profiler being driven over ssh by
+// one running on another machine. No browser, no server, nothing on stdout but
+// the JSON asked for: stdout is a protocol here, so the progress lines the
+// interactive paths print go to stderr instead.
+async function runJsonMode(command, id, options) {
+  const { listSessions } = require('./session-index.js');
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };
 
+  if (command === 'probe') {
+    const { PROTOCOL } = require('./remote.js');
+    process.stdout.write(JSON.stringify({
+      protocol: PROTOCOL,
+      version: require('./package.json').version
+    }));
+    return;
+  }
+
+  if (command === 'list') {
+    // `file` is a path on this machine, which means nothing to the caller and
+    // would be misleading in its UI; the id is what it addresses sessions by.
+    const sessions = listSessions(deps).map(({ file, ...rest }) => rest);
+    process.stdout.write(JSON.stringify({ sessions }));
+    return;
+  }
+
+  // How fresh a session is, which is what the caller keys its profile cache
+  // on. Answered from a stat rather than from a summary, so that asking costs
+  // one round trip and no parsing.
+  if (command === 'stamp') {
+    if (!id) {
+      throw new Error('--json stamp needs a session id');
+    }
+
+    const file = sessionFileById(id);
+    process.stdout.write(JSON.stringify({
+      stamp: file ? fs.statSync(file).mtimeMs : null
+    }));
+    return;
+  }
+
+  if (command === 'profile') {
+    if (!id) {
+      throw new Error('--json profile needs a session id');
+    }
+
+    const file = sessionFileById(id);
+    if (!file) {
+      throw new Error(`Unknown session ${id}`);
+    }
+
+    process.stdout.write(buildProfile(file, options.size, options.at));
+    return;
+  }
+
+  throw new Error(`Unknown --json command "${command}"`);
+}
+
+// The file a session id names. Only the filenames are needed to answer this,
+// so it never parses a transcript — building every summary to map an id to a
+// path is over a second of work for something the directory listing already
+// knows.
+function sessionFileById(id) {
+  const { findSessionFiles } = require('./session-index.js');
+  return findSessionFiles().find(
+    (entry) => path.basename(entry.file, '.jsonl') === id
+  )?.file || null;
+}
+
+// The server behind the session picker. Unlike startServer, which serves one
+// profile and shuts down as soon as it has been fetched, this one stays up:
+// the page is a menu, and every button on it needs a profile built on demand.
+//
+// `source` is what makes this serve a remote machine as readily as this one:
+// it supplies the session list and the built profiles, and everything below —
+// the page, the caching, the URLs handed to the front end — is the same either
+// way.
+function startIndexServer(profilerOrigin, options = {}, source = localSource()) {
+  const { renderPage } = require('./session-index.js');
+
   // Built once per request rather than cached, so that reloading the page picks
   // up sessions that have run since it was opened.
-  const sessions = () => listSessions(deps);
+  const sessions = () => source.sessions();
 
   // Profiles are served from the same origin the front end fetches them from,
   // so each one gets a URL of its own. Insertion order is what makes the oldest
@@ -1903,7 +1973,9 @@ function startIndexServer(profilerOrigin, options = {}) {
 
     try {
       if (url.pathname === '/') {
-        return sendHtml(res, renderPage(sessions(), { size: options.size }));
+        return sendHtml(res, renderPage(await sessions(), {
+          size: options.size, host: source.host
+        }));
       }
 
       if (url.pathname.startsWith('/open/')) {
@@ -1916,23 +1988,15 @@ function startIndexServer(profilerOrigin, options = {}) {
           return sendJson(res, 400, { error: 'Malformed session id' });
         }
 
-        // Mapping an id to its file only needs the file list, not the summary
-        // of every session: building those parses every sub-agent transcript,
-        // which is over a second of work to answer a question the filenames
-        // already answer.
-        const session = findSessionFiles().find(
-          (entry) => path.basename(entry.file, '.jsonl') === id
-        );
-        if (!session) {
-          return sendJson(res, 404, { error: `Unknown session ${id}` });
-        }
-
         const wantsSize = url.searchParams.get('size') === '1';
-        // The file's mtime is part of the key, so that profiling a session
+        // The source's stamp is part of the key, so that profiling a session
         // again after working in it some more builds a new profile rather than
         // serving the one from before: the live session is exactly the one
         // worth re-profiling.
-        const stamp = fs.statSync(session.file).mtimeMs;
+        const stamp = await source.stamp(id);
+        if (stamp === null) {
+          return sendJson(res, 404, { error: `Unknown session ${id}` });
+        }
         const key = `${id}:${wantsSize ? 'size' : 'timeline'}:${stamp}`;
 
         if (!profiles.has(key)) {
@@ -1943,8 +2007,25 @@ function startIndexServer(profilerOrigin, options = {}) {
           while (profiles.size >= PROFILES_KEPT) {
             profiles.delete(profiles.keys().next().value);
           }
-          profiles.set(key, buildProfile(session.file, wantsSize, options.at));
+
+          // The promise goes in, not the profile: building one is slow enough
+          // — seconds locally, and a whole ssh round trip for a remote machine
+          // — that a second click on the same row lands while the first is
+          // still building. Storing the promise is what makes that second
+          // click wait for the build already running rather than start its
+          // own.
+          const building = (async () =>
+            source.profile(id, wantsSize, options.at))();
+          // A failed build must not be left in the map: it would be served as
+          // a rejected promise forever, and the retry the person is about to
+          // make would fail the same way without ever trying again.
+          building.catch(() => profiles.delete(key));
+          profiles.set(key, building);
         }
+
+        // Awaited here rather than where it was stored, so that the request
+        // that found a build already in flight waits for it too.
+        await profiles.get(key);
 
         const { port } = server.address();
         const profileUrl = `http://127.0.0.1:${port}/profile/${encodeURIComponent(key)}`;
@@ -1955,11 +2036,15 @@ function startIndexServer(profilerOrigin, options = {}) {
 
       if (url.pathname.startsWith('/profile/')) {
         const key = decodeURIComponent(url.pathname.slice('/profile/'.length));
-        const body = profiles.get(key);
-        if (!body) {
+        const pending = profiles.get(key);
+        if (!pending) {
           return sendJson(res, 404, { error: `Unknown profile ${key}` });
         }
-        return sendProfile(req, res, body, profilerOrigin);
+        // What is stored is the build, which has normally finished by now —
+        // the front end only fetches this after /open/ has resolved. Awaiting
+        // it anyway costs nothing and covers the tab that was reloaded while a
+        // build was still running.
+        return sendProfile(req, res, await pending, profilerOrigin);
       }
 
       sendJson(res, 404, { error: 'Not found' });
@@ -1976,10 +2061,67 @@ function startIndexServer(profilerOrigin, options = {}) {
   });
 }
 
+// This machine's sessions: read from ~/.claude/projects and profiled in
+// process. The methods are async only because the remote source's are, and the
+// server awaits both through the same code.
+function localSource() {
+  const { listSessions } = require('./session-index.js');
+  const deps = {
+    readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
+  };
+
+  return {
+    host: null,
+    sessions: async () => listSessions(deps),
+
+    stamp: async (id) => {
+      const file = sessionFileById(id);
+      return file ? fs.statSync(file).mtimeMs : null;
+    },
+
+    profile: async (id, wantsSize, at) => buildProfile(sessionFileById(id), wantsSize, at)
+  };
+}
+
+// Another machine's sessions, over ssh. Each method is one `claude-profiler
+// --json` run there; nothing is parsed on this side beyond the list, since the
+// profile is served through untouched.
+function remoteSource(host) {
+  const remote = require('./remote.js');
+
+  // The last listing, kept so that a click does not need a second round trip
+  // to learn how fresh the session was. The page is always fetched before any
+  // button on it can be pressed, so by the time a stamp is wanted this is
+  // populated and describes the very rows being clicked.
+  let lastSeen = new Map();
+
+  return {
+    host,
+
+    sessions: async () => {
+      const sessions = await remote.listSessions(host);
+      lastSeen = new Map(sessions.map((session) => [session.id, session.ended]));
+      return sessions;
+    },
+
+    // One stat over ssh, so that a session which has grown since the page was
+    // drawn is rebuilt rather than served from the cache — the live session
+    // being exactly the one worth re-profiling. The listing's timestamp is the
+    // fallback for a remote too old to answer `--json stamp`, and for the tab
+    // that outlived its server: without it a click would 404 until reloaded.
+    stamp: async (id) => await remote.stamp(host, id) ?? lastSeen.get(id) ?? null,
+
+    profile: async (id, wantsSize, at) => {
+      console.log(`Building ${wantsSize ? 'size' : 'timeline'} profile for ${id} on ${host}`);
+      return remote.buildProfile(host, id, { size: wantsSize, at });
+    }
+  };
+}
+
 // Serializing here rather than at fetch time keeps the profile route cheap and
 // lets a build failure surface on the button that triggered it.
 function buildProfile(file, wantsSize, at = 'peak') {
-  console.log(`Building ${wantsSize ? 'size' : 'timeline'} profile for ${file}`);
+  console.error(`Building ${wantsSize ? 'size' : 'timeline'} profile for ${file}`);
 
   const entries = readJsonlFile(file);
   const subagents = readSubagents(file);
@@ -2039,11 +2181,11 @@ function sendProfile(req, res, body, profilerOrigin) {
 // `claude-profiler` with no file: serve the picker and open it. This does not
 // return — the server has to outlive the request that built the page, so the
 // process runs until it is interrupted.
-async function runSessionIndex(profilerOrigin, options = {}) {
+async function runSessionIndex(profilerOrigin, options = {}, source = localSource()) {
   // The count is not printed here: the page builds the same list when it is
   // fetched a moment later, and scanning every session twice is over a second
   // of work before anything appears.
-  const { serverUrl } = await startIndexServer(profilerOrigin, options);
+  const { serverUrl } = await startIndexServer(profilerOrigin, options, source);
   console.log(`Session list at ${serverUrl}`);
 
   if (!await openUrl(serverUrl)) {
@@ -2051,6 +2193,107 @@ async function runSessionIndex(profilerOrigin, options = {}) {
   }
 
   console.log('Press Ctrl+C to stop.');
+}
+
+// A leading ~ is the shell's to expand, and an unquoted path has already had
+// it done; this is for the quoted ones that reach here literal.
+function expandUser(value) {
+  return value.startsWith('~')
+    ? path.join(os.homedir(), value.slice(1))
+    : value;
+}
+
+// `claude-profiler <host>`: the same picker, listing another machine's
+// sessions. The remote needs a claude-profiler of its own to answer with —
+// this is where a machine that has not got one is offered it.
+async function runRemoteIndex(host, profilerOrigin, options) {
+  const remote = require('./remote.js');
+
+  // ssh takes the host as its own argument rather than through a shell, so it
+  // cannot be injected — but a leading dash still makes ssh read it as an
+  // option of its own, which is a confusing usage dump rather than an answer.
+  if (host.startsWith('-')) {
+    console.error(`Error: "${host}" is not a machine name.`);
+    process.exit(1);
+  }
+
+  console.log(`Checking ${host}...`);
+  let state = await remote.probe(host);
+
+  if (state.status === 'unreachable') {
+    console.error(`Error: could not reach ${host}: ${state.message}`);
+    console.error('');
+    console.error(`If ${host} is a file rather than a machine, it does not exist.`);
+    process.exit(1);
+  }
+
+  if (state.status !== 'ok') {
+    const missing = state.status === 'missing';
+    // Naming both versions is what makes an outdated remote diagnosable: the
+    // two are otherwise indistinguishable from here, and the same sentence
+    // covers a machine that is merely behind and one whose npm pulled a
+    // published package older than the checkout driving it.
+    console.log(missing
+      ? `claude-profiler is not installed on ${host}.`
+      : `The claude-profiler on ${host} is too old to be driven remotely` +
+        `${state.version ? ` (${state.version}, this is ` +
+          `${require('./package.json').version})` : ''}.`);
+
+    if (!await confirm(`Install it there with npm now?`)) {
+      console.error('Nothing to list without it.');
+      process.exit(1);
+    }
+
+    if (!await remote.install(host)) {
+      console.error(`Error: the install on ${host} failed.`);
+      process.exit(1);
+    }
+
+    // Confirming rather than assuming: npm can exit 0 having installed
+    // something that still is not on the PATH of a login shell, and finding
+    // that out now is better than on the first blank page.
+    state = await remote.probe(host);
+    if (state.status !== 'ok') {
+      console.error(`Error: claude-profiler on ${host} still does not answer ` +
+        `--json after installing` +
+        `${state.version ? ` (it is ${state.version})` : ''}.`);
+      console.error('');
+      // The install came from the published package, so the overwhelmingly
+      // likely cause is that what is published predates remote support — not
+      // anything wrong with the machine. Saying so is the difference between a
+      // one-line fix and an afternoon debugging ssh.
+      console.error(`npm installed it from ${remote.PACKAGE},`);
+      console.error(`which looks older than the ${require('./package.json').version} ` +
+        `running here. Remote support`);
+      console.error('is only in versions that answer `--json`.');
+      console.error('');
+      console.error('Push your commits, then try again.');
+      process.exit(1);
+    }
+  }
+
+  return runSessionIndex(profilerOrigin, options, remoteSource(host));
+}
+
+// A yes/no on the terminal. Anything but an explicit yes is a no: the question
+// is only ever asked before doing something to another machine.
+function confirm(question) {
+  return new Promise((resolve) => {
+    // A piped stdin has nothing to answer with, and blocking forever on a read
+    // that will never come is worse than declining.
+    if (!process.stdin.isTTY) {
+      console.log(`${question} (no — stdin is not a terminal)`);
+      return resolve(false);
+    }
+
+    const readline = require('readline').createInterface({
+      input: process.stdin, output: process.stdout
+    });
+    readline.question(`${question} [y/N] `, (answer) => {
+      readline.close();
+      resolve(/^y(es)?$/i.test(answer.trim()));
+    });
+  });
 }
 
 // Opens a URL in the browser, which is how both the picker and a profile get
@@ -2093,9 +2336,21 @@ async function main() {
   // --size builds a size profile of the context window instead of a timeline.
   let sizeProfile = false;
   let sizeAt = 'peak';
+  // --json makes this the far end of an ssh, answering another
+  // claude-profiler in JSON rather than opening anything.
+  let json = null;
+  // --host names an ssh host explicitly, for the machine whose name happens to
+  // also be a file in the working directory.
+  let host = null;
   const positional = [];
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--profiler-origin') {
+    if (args[i] === '--json') {
+      json = args[++i] || 'list';
+    } else if (args[i] === '--host') {
+      host = args[++i];
+    } else if (args[i].startsWith('--host=')) {
+      host = args[i].slice('--host='.length);
+    } else if (args[i] === '--profiler-origin') {
       profilerOrigin = args[++i];
     } else if (args[i].startsWith('--profiler-origin=')) {
       profilerOrigin = args[i].slice('--profiler-origin='.length);
@@ -2105,24 +2360,56 @@ async function main() {
       sizeAt = args[++i];
     } else if (args[i].startsWith('--at=')) {
       sizeAt = args[i].slice('--at='.length);
+    } else if (args[i].startsWith('-') && args[i] !== '-') {
+      // Anything else beginning with a dash is a mistyped flag. Left in the
+      // positionals it would be read as a filename, or — worse — as the name
+      // of a machine, and handed to ssh as an option of its own.
+      console.error(`Error: unknown option "${args[i]}"`);
+      process.exit(1);
     } else {
       positional.push(args[i]);
     }
   }
 
+  // A flag whose value is missing takes the next argument, and at the end of
+  // the line there is none. Silence here is the dangerous case: `--host` with
+  // nothing after it would otherwise fall through to listing this machine,
+  // under a heading that does not say which machine it is.
+  //
+  // Only the flags that were actually given are checked — a flag left off the
+  // command line is not one with a missing value. `--json` is exempt because
+  // it defaults to `list` rather than to nothing.
+  for (const [flag, value] of [['--host', host], ['--at', sizeAt]]) {
+    if (value === undefined || value === '') {
+      console.error(`Error: ${flag} needs a value`);
+      process.exit(1);
+    }
+  }
+
+  if (positional.length > 1) {
+    console.error(`Error: expected one file or machine, got ${positional.length}`);
+    console.error(`  ${positional.join(' ')}`);
+    process.exit(1);
+  }
+
   if (!profilerOrigin) {
-    console.error('Usage: claude-profiler [jsonl-file] [options]');
+    console.error('Usage: claude-profiler [jsonl-file | ssh-host] [options]');
     console.error('');
-    console.error('With no file, lists every session found under ~/.claude/projects/');
-    console.error('in a browser, to pick one from.');
+    console.error('With no argument, lists every session found under');
+    console.error('~/.claude/projects/ in a browser, to pick one from. Given the');
+    console.error('name of a machine you can ssh into, lists that machine\'s');
+    console.error('sessions instead, and profiles them there.');
     console.error('');
     console.error('  --size                  Profile what fills the context window,');
     console.error('                          instead of the session timeline.');
     console.error('  --at peak|last          Which API call\'s window to profile,');
     console.error('                          with --size. Defaults to peak.');
+    console.error('  --host <name>           Treat the argument as an ssh host,');
+    console.error('                          even if a file of that name exists.');
     console.error('  --profiler-origin <url> Front end to open.');
     console.error('');
     console.error('Example: claude-profiler');
+    console.error('         claude-profiler my-build-machine');
     console.error('         claude-profiler ~/.claude/projects/my-project/my-session.jsonl');
     process.exit(1);
   }
@@ -2132,6 +2419,28 @@ async function main() {
     process.exit(1);
   }
 
+  // The far end of an ssh from another claude-profiler. Checked before
+  // anything else, since none of the interactive paths below apply.
+  if (json) {
+    return runJsonMode(json, positional[0], { size: sizeProfile, at: sizeAt });
+  }
+
+  // A bare name that is not a file on disk is a machine to ssh into. Trying
+  // the filesystem first is what keeps `claude-profiler some-session.jsonl`
+  // working unchanged, and --host is the way to say "a host" about a name that
+  // is also a file.
+  //
+  // A mistyped path should say so rather than be handed to ssh, so anything
+  // shaped like a path — a separator in it, or the .jsonl the sessions all end
+  // in — is a file that does not exist. What is left is `user@host`, `host`,
+  // and the names in ~/.ssh/config, none of which contain a slash.
+  const target = host || positional[0];
+  const pathShaped = target &&
+    (target.includes('/') || target.startsWith('~') || target.endsWith('.jsonl'));
+  if (host || (target && !pathShaped && !fs.existsSync(target))) {
+    return runRemoteIndex(target, profilerOrigin, { size: sizeProfile, at: sizeAt });
+  }
+
   // No file named: list the sessions instead and let one be picked from the
   // browser. The server stays up until it is interrupted, since the page is a
   // menu that profiles are built from one at a time.
@@ -2139,9 +2448,7 @@ async function main() {
     return runSessionIndex(profilerOrigin, { size: sizeProfile, at: sizeAt });
   }
 
-  const filePath = positional[0].startsWith('~')
-    ? path.join(os.homedir(), positional[0].slice(1))
-    : path.resolve(positional[0]);
+  const filePath = path.resolve(expandUser(positional[0]));
 
   if (!fs.existsSync(filePath)) {
     console.error(`Error: File not found: ${filePath}`);

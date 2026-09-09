@@ -42,6 +42,13 @@ button on it builds the profile and opens it. Sort by any column to find the
 session worth looking at: the expensive one, the long one, the one with the
 sub-agents.
 
+To look at another machine instead, give its name. Anything you can `ssh`
+into works, and the sessions are listed and profiled the same way:
+
+```sh
+claude-profiler my-build-machine
+```
+
 That is the whole workflow. Everything below is detail.
 
 ## Usage
@@ -98,13 +105,50 @@ Server started at http://127.0.0.1:60659/
 Opening Firefox Profiler...
 ```
 
+### Another machine
+
+Given a name that is not a file, `claude-profiler` treats it as an ssh host:
+
+```sh
+claude-profiler m4
+```
+
+The list is that machine's sessions, and the **Profiler** button builds the
+profile there. Only JSON crosses the network — the transcripts stay where they
+are, which matters because they are usually the largest thing on the machine.
+
+This needs `claude-profiler` installed on the remote as well, since that is
+what reads the sessions and builds the profiles. If it is missing, you are
+offered the install:
+
+```
+Checking m4...
+claude-profiler is not installed on m4.
+Install it there with npm now? [y/N]
+```
+
+Two things that catch people out:
+
+- The remote needs `node` and `npm` on the PATH of a **login** shell. A
+  non-interactive `ssh host command` on macOS reads no profile at all, so
+  commands are run through `zsh -lc` to get the PATH a terminal there would
+  have.
+- A machine whose name is also a file in the working directory is read as the
+  file. Use `--host` to say you meant the machine.
+
+The profile is built on the remote and served from this machine, so the
+profiler front end fetches it from a local address as usual — no port
+forwarding, and nothing listening on the remote.
+
 ### Options
 
 | | |
 |---|---|
 | `--size` | Profile what fills the context window, instead of the session timeline. With no file given, starts the session list with its checkbox already ticked. |
 | `--at peak\|last` | Which API call's window to profile, with `--size`. Defaults to `peak`. |
+| `--host <name>` | Treat the argument as an ssh host, even when a file of that name exists. |
 | `--profiler-origin <url>` | Front end to open, and the origin allowed to fetch the profile. Defaults to `https://profiler.firefox.com`, or `$PROFILER_ORIGIN` if set. |
+| `--json <command>` | Answer in JSON on stdout instead of opening anything: `probe`, `list`, `stamp <id>`, or `profile <id>`. This is how a `claude-profiler` driving another one over ssh talks to it, and is not meant to be typed. |
 
 The profile is served with an `Access-Control-Allow-Origin` header for that
 origin, since the front end fetches it from the browser.
@@ -284,6 +328,8 @@ to add a profiler button to each session row.
 - `index.js` — the CLI, the session list server and the timeline profile builder.
 - `session-index.js` — finds and summarizes the sessions, and renders the list
   page.
+- `remote.js` — driving another machine's `claude-profiler` over ssh: probing
+  for it, offering to install it, and fetching its listings and profiles.
 - `context-size.js` — context window reconstruction, calibration and the size
   profile.
 - `size-profile.js` — attribution of bytes to stacks, and the profile tables.
@@ -295,5 +341,5 @@ to add a profiler button to each session row.
   usage objects, sub-agent layout, cost formula and known limitations.
 
 `npm test` covers the shell parsing, the output attribution, the window
-reconstruction, the calibration, the transcript line mapping and the session
-list.
+reconstruction, the calibration, the transcript line mapping, the session list
+and the remote protocol.

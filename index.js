@@ -449,16 +449,20 @@ function sessionTitle(jsonlData) {
   return 'Main conversation';
 }
 
-// One requestId = one API call, but several entries can share it.
+// One requestId = one API call, but several entries can share it: a response
+// split across content blocks is logged once per block. Those entries carry
+// snapshots of the same usage, and only the input side has settled — the
+// earlier ones caught the stream mid-flight, with an `output_tokens` still
+// counting up. The last entry holds the total, so it is the one to keep;
+// keeping the first undercounts output on every split response.
 function uniqueApiCalls(messages) {
-  const seenRequestIds = new Set();
-  return messages.filter(msg => {
-    if (!msg.message?.usage || !msg.requestId || seenRequestIds.has(msg.requestId)) {
-      return false;
+  const lastByRequestId = new Map();
+  messages.forEach(msg => {
+    if (msg.message?.usage && msg.requestId) {
+      lastByRequestId.set(msg.requestId, msg);
     }
-    seenRequestIds.add(msg.requestId);
-    return true;
   });
+  return [...lastByRequestId.values()];
 }
 
 function totalCost(messages) {

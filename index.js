@@ -31,19 +31,36 @@ const PRICING = [
   { match: /3-haiku|haiku/, input: 0.25, output: 1.25 }
 ];
 
+// Fast mode is a different price for the same model, so it is matched on the
+// model before the table above. Opus 5 and 4.8 cost twice their standard rate,
+// Opus 4.7 and 4.6 six times it, and no other model offers fast mode.
+const FAST_MODE_PRICING = [
+  { match: /opus-4-8|opus-5/, input: 10.00, output: 50.00 },
+  { match: /opus-4-[67]/, input: 30.00, output: 150.00 }
+];
+
 // Sonnet, as the middle of the range, when the model is unknown.
 const DEFAULT_PRICING = { input: 3.00, output: 15.00 };
+
+// Each web search is a flat fee on top of the tokens, at every tier.
+const WEB_SEARCH_REQUEST_COST = 0.01;
 
 const CACHE_WRITE_5M_MULTIPLIER = 1.25;
 const CACHE_WRITE_1H_MULTIPLIER = 2;
 const CACHE_READ_MULTIPLIER = 0.1;
 
-function getPricingForModel(modelId) {
+function getPricingForModel(modelId, usage) {
   if (!modelId) {
     return DEFAULT_PRICING;
   }
 
   const model = modelId.toLowerCase();
+  if (usage?.speed === 'fast') {
+    const fast = FAST_MODE_PRICING.find(pricing => pricing.match.test(model));
+    if (fast) {
+      return fast;
+    }
+  }
   return PRICING.find(pricing => pricing.match.test(model)) || DEFAULT_PRICING;
 }
 
@@ -63,13 +80,18 @@ function calculateCost(usage, pricing) {
     pricing.input / 1000000;
   const cacheReadCost =
     (usage.cache_read_input_tokens || 0) * CACHE_READ_MULTIPLIER * pricing.input / 1000000;
+  // A flat fee per search rather than anything token priced, so it rides
+  // outside the per-million arithmetic above.
+  const webSearchCost =
+    (usage.server_tool_use?.web_search_requests || 0) * WEB_SEARCH_REQUEST_COST;
 
   return {
     input: inputCost,
     output: outputCost,
     cacheWrite: cacheWriteCost,
     cacheRead: cacheReadCost,
-    total: inputCost + outputCost + cacheWriteCost + cacheReadCost
+    webSearch: webSearchCost,
+    total: inputCost + outputCost + cacheWriteCost + cacheReadCost + webSearchCost
   };
 }
 
@@ -80,18 +102,18 @@ const TOOLS_CATEGORY = 3;
 const MODEL_CATEGORY = 5;
 const IDLE_CATEGORY = 6;
 
-// A running total that keeps the four parts of a cost as well as their sum, so
-// the cumulative graphs can be stacked by what the money went on rather than
-// drawn as one line. Each `add` returns the totals as of that call, which is
-// what the marker at that point reports.
+// A running total that keeps the parts of a cost as well as their sum, so the
+// cumulative graphs can be stacked by what the money went on rather than drawn
+// as one line. Each `add` returns the totals as of that call, which is what the
+// marker at that point reports.
 class RunningCost {
   constructor() {
-    this.sums = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+    this.sums = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, webSearch: 0 };
   }
 
   add(costs) {
     for (const part of Object.keys(this.sums)) {
-      this.sums[part] += costs[part];
+      this.sums[part] += costs[part] || 0;
     }
     return { ...this.sums, total: this.total() };
   }
@@ -101,15 +123,16 @@ class RunningCost {
   }
 }
 
-// The four things an API call is billed for, in the order they are stacked and
-// the colour each keeps in every chart that shows cost. One colour per part
-// throughout means a spike on the Cost chart can be followed into the
-// cumulative ones: the band that jumped is the band that grew.
+// What an API call is billed for, in the order they are stacked and the colour
+// each keeps in every chart that shows cost. One colour per part throughout
+// means a spike on the Cost chart can be followed into the cumulative ones: the
+// band that jumped is the band that grew.
 const COST_PARTS = [
   { key: 'cacheRead', label: 'Cache read', color: 'blue' },
   { key: 'cacheWrite', label: 'Cache write', color: 'orange' },
   { key: 'input', label: 'Input', color: 'green' },
-  { key: 'output', label: 'Output', color: 'purple' }
+  { key: 'output', label: 'Output', color: 'purple' },
+  { key: 'webSearch', label: 'Web search', color: 'yellow' }
 ];
 
 // The numbers a stacked cost chart plots. The front end draws every graph entry
@@ -334,7 +357,7 @@ function contextTokensOf(usage) {
 // tokens bought it. A string rather than two fields, so the tooltip reads as
 // four lines instead of eight, and empty when nothing was billed — a call with
 // no cache write should not claim a $0 one.
-function costWithTokens(cost, tokens) {
+function costWithTokens(cost, tokens, unit = 'tokens') {
   if (!cost && !tokens) {
     return undefined;
   }
@@ -342,7 +365,7 @@ function costWithTokens(cost, tokens) {
     minimumFractionDigits: 4,
     maximumFractionDigits: 4
   });
-  return `${amount}$ (${(tokens || 0).toLocaleString()} tokens)`;
+  return `${amount}$ (${(tokens || 0).toLocaleString()} ${unit})`;
 }
 
 function readJsonlFile(filePath) {
@@ -467,7 +490,7 @@ function uniqueApiCalls(messages) {
 
 function totalCost(messages) {
   return uniqueApiCalls(messages).reduce((sum, msg) => {
-    const pricing = getPricingForModel(msg.message.model);
+    const pricing = getPricingForModel(msg.message.model, msg.message.usage);
     return sum + calculateCost(msg.message.usage, pricing).total;
   }, 0);
 }
@@ -1035,6 +1058,12 @@ function buildThread({
         input: costWithTokens(costs.input, usage.input_tokens),
         cacheRead: costWithTokens(costs.cacheRead, usage.cache_read_input_tokens),
         cacheWrite: costWithTokens(costs.cacheWrite, usage.cache_creation_input_tokens),
+        // Priced per search rather than per token, so the row counts searches.
+        webSearch: costWithTokens(
+          costs.webSearch,
+          usage.server_tool_use?.web_search_requests,
+          'searches'
+        ),
         ...stackedCost(costs)
       });
     }
@@ -1375,7 +1404,10 @@ function createFirefoxProfile(jsonlData, subagents) {
         msg,
         start: response ? response.start : logged,
         time: response ? response.end : logged,
-        costs: calculateCost(msg.message.usage, getPricingForModel(msg.message.model))
+        costs: calculateCost(
+          msg.message.usage,
+          getPricingForModel(msg.message.model, msg.message.usage)
+        )
       };
     });
 
@@ -1724,6 +1756,11 @@ function createFirefoxProfile(jsonlData, subagents) {
         {
           key: 'cacheWrite',
           label: 'Cache write',
+          format: 'string'
+        },
+        {
+          key: 'webSearch',
+          label: 'Web search',
           format: 'string'
         },
         // Drawn, not read: the bands come from these.

@@ -39,10 +39,9 @@ claude-profiler
 Each row is a session — what it was about, where it ran, when it started, how
 long it actually worked, and its measured usage. Claude rows report calculated
 dollar cost and have a **Profiler** button. For a signed-in Enterprise account,
-Codex rows report backend-estimated credits and dollars as well as locally
-recorded tokens; Codex profiles are not built yet. Sort by any column to find
-the session worth looking at: the expensive one, the long one, or the one with
-sub-agents.
+Codex rows report backend-estimated dollars; Codex profiles are not built yet.
+Sort by any column to find the session worth looking at: the expensive one, the
+long one, or the one with sub-agents.
 
 To look at another machine instead, give its name. Anything you can `ssh`
 into works, and the sessions are listed and profiled the same way:
@@ -69,8 +68,8 @@ Press Ctrl+C to stop.
 The page interleaves sessions under `~/.claude/projects/` and
 `~/.codex/sessions/`, newest start first. A row carries its provider, title,
 working directory and branch, start time, active time, message and sub-agent
-counts, size on disk, Codex tokens and credits where available, and estimated
-dollar cost. Cost is banded so expensive sessions stand out.
+counts, size on disk, and estimated dollar cost. Cost is banded so expensive
+sessions stand out.
 
 Codex JSONL does not contain a dollar amount or consumed-credit amount. Its
 `rate_limits.credits` object only records whether credits are enabled. When the
@@ -78,9 +77,9 @@ local Codex login is available in `~/.codex/auth.json`, the picker uses the same
 authenticated per-thread usage endpoint as Codex's `thread-credits` and
 `estimated-thread-cost` status-line items. Spawned-agent estimates are included
 in their root session. The API is best-effort: when offline, signed out, or when
-the backend omits an old thread, the row falls back to cumulative tokens from
-disk rather than treating unavailable billing data as zero. Hovering the token
-number shows the locally recorded input/cache/output split.
+the backend omits an old thread, the row leaves cost blank rather than treating
+unavailable billing data as zero. Locally recorded tokens remain available in
+the JSON session summary, but are omitted from the table to keep it compact.
 
 Clicking a column header sorts by it, so "which session cost the most" and
 "which one ran the most sub-agents" are one click each. The checkbox at the top

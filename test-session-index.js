@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const {
   findSessionFiles, listSessions, renderPage, formatBytes, formatCost,
-  formatDuration, formatTokens, formatCredits, projectLabel
+  formatDuration, projectLabel
 } = require('./session-index.js');
 
 let failures = 0;
@@ -133,13 +133,6 @@ check('formats bytes', [formatBytes(512), formatBytes(2048), formatBytes(5 << 20
 check('formats cost, and says nothing for a free session',
   [formatCost(0), formatCost(0.004), formatCost(12.5)], ['—', '<$0.01', '$12.50']);
 
-check('formats exact Codex token counts',
-  [formatTokens(0), formatTokens(1234567)], ['—', '1,234,567']);
-
-check('formats backend credit estimates',
-  [formatCredits(null), formatCredits(12.5), formatCredits(0.000004)],
-  ['—', '12.50', '0.000004']);
-
 check('formats a duration in hours and minutes', formatDuration(3900000), '1h 5m');
 
 check('turns a project directory name back into a path',
@@ -153,14 +146,13 @@ const html = renderPage(sessions);
 // page's `dataset['sort' + column]` found nothing and no column ever sorted.
 const sortAttributes = [...html.matchAll(/data-sort(\d+)=/g)].map(m => m[1]);
 check('rows carry the sort keys the script reads',
-  [...new Set(sortAttributes)].sort(),
-  ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']);
+  [...new Set(sortAttributes)].sort(), ['0', '1', '2', '3', '4', '5', '6', '7']);
 
 check('the script reads the attribute the rows actually carry',
   html.includes("getAttribute('data-sort' + column)"), true);
 
 // Sorting has to be on the numbers: "9 MB" sorts above "10 MB" as text.
-const costKeys = [...html.matchAll(/data-sort8="([^"]*)"/g)].map(m => m[1]);
+const costKeys = [...html.matchAll(/data-sort6="([^"]*)"/g)].map(m => m[1]);
 check('the cost sort key is the raw number, not the formatted figure',
   costKeys.every(k => k !== '' && !isNaN(k)), true);
 
@@ -184,7 +176,7 @@ check('the page offers the --size option', html.includes('id="size"'), true);
 
 check('Claude rows are labeled', html.includes('provider claude">Claude'), true);
 
-check('a Codex row is labeled, reports tokens, and offers no Claude profile', (() => {
+check('a Codex row is labeled, reports cost, and offers no Claude profile', (() => {
   const page = renderPage([{
     ...sessions[0], provider: 'codex', id: 'codex', tokens: 1234,
     credits: 12.5, cost: 1.25,
@@ -194,9 +186,8 @@ check('a Codex row is labeled, reports tokens, and offers no Claude profile', ((
     }
   }]);
   return page.includes('provider codex">Codex') &&
-    page.includes('>1,234</td>') && page.includes('>12.50</td>') &&
     page.includes('>$1.25</td>') && !page.includes('data-id="codex"') &&
-    page.includes('Cached input: 1,000');
+    !page.includes('Codex tokens') && !page.includes('Codex credits');
 })(), true);
 
 check('a title with markup in it is escaped', (() => {
@@ -240,8 +231,7 @@ check('the script reorders the groups', html.includes('table.append(...sorted)')
 // few characters wide in a narrow window and breaks a path down it.
 check('the path is a full-width row under the figures',
   new RegExp(`<tr class="path">\\s*<td colspan="${
-    ['Session','Started','Active','Messages','Sub-agents','Size',
-      'Codex tokens','Codex credits','Est. cost','']
+    ['Session','Started','Active','Messages','Sub-agents','Size','Est. cost','']
       .length - 3}"`).test(html), true);
 
 check('the path row carries the working directory and branch',

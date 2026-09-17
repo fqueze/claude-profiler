@@ -2157,11 +2157,20 @@ function localSource() {
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };
+  // Begin the Codex scan and billing call before the HTTP server is opened.
+  // The browser launch and Claude scan then overlap the network round trip,
+  // while the first page request reuses this exact promise instead of issuing
+  // a second request. Later reloads still read fresh data.
+  const nextCodexSessions = prefetchFirst(listCodexSessions);
 
   return {
     host: null,
-    sessions: async () => [...listSessions(deps), ...(await listCodexSessions())]
-      .sort((a, b) => (b.started || '').localeCompare(a.started || '')),
+    sessions: async () => {
+      const codex = nextCodexSessions();
+      const claude = listSessions(deps);
+      return [...claude, ...(await codex)]
+        .sort((a, b) => (b.started || '').localeCompare(a.started || ''));
+    },
 
     stamp: async (id) => {
       const { provider, sessionId } = parseSessionKey(id);
@@ -2176,6 +2185,23 @@ function localSource() {
         ? buildCodexProfile(sessionId)
         : buildProfile(sessionFileById(sessionId), wantsSize, at);
     }
+  };
+}
+
+// Start one asynchronous load now and hand it to the first consumer later.
+// Attaching a handler immediately keeps a startup failure from becoming an
+// unhandled rejection if the browser never reaches the page; awaiting the same
+// promise still reports that failure to a consumer that does arrive.
+function prefetchFirst(load) {
+  let first = load();
+  first.catch(() => {});
+  return () => {
+    if (first) {
+      const result = first;
+      first = null;
+      return result;
+    }
+    return load();
   };
 }
 
@@ -2618,6 +2644,7 @@ module.exports = {
   readSubagents,
   readSubagentsForSession,
   createFirefoxProfile,
+  prefetchFirst,
   // Size profile of the context window, from context-size.js.
   createSizeProfile: (...args) => require('./context-size.js').createSizeProfile(...args)
 };

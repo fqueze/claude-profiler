@@ -13,6 +13,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { PROTOCOL, shellQuote } = require('./remote.js');
 const { renderPage } = require('./session-index.js');
+const { prefetchFirst } = require('./index.js');
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -240,6 +241,21 @@ const cacheCheck = (async () => {
   const index = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf-8');
   check('index.js caches the build rather than the built profile',
     /building\.catch\(\(\) => profiles\.delete\(key\)\)/.test(index), true);
+
+  let loads = 0;
+  let release;
+  const firstLoad = new Promise(resolve => { release = resolve; });
+  const next = prefetchFirst(() => {
+    loads++;
+    return loads === 1 ? firstLoad : Promise.resolve('fresh');
+  });
+  check('the initial Codex load starts before the page asks for it', loads, 1);
+  const prefetched = next();
+  check('the first page does not start a second Codex load', loads, 1);
+  release('prefetched');
+  check('the first page receives the prefetched load', await prefetched, 'prefetched');
+  check('a later page receives fresh data', await next(), 'fresh');
+  check('a later page starts a new Codex load', loads, 2);
 
   console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
   process.exit(failures === 0 ? 0 : 1);

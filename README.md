@@ -304,10 +304,12 @@ exactly; see [Known Limitations](JSONL_FORMAT.md#known-limitations).
 
 A Codex profile has one track for the root thread and one for every spawned
 agent. It includes logged turn spans, user and agent messages, reasoning,
-commands, MCP calls, file changes and other tool activity. Each track ends with
-a token-usage marker; the root usage marker also carries the backend's aggregate
-credit and dollar estimates when they are available. The picker keeps those
-extra figures inside the profile rather than adding columns to the compact
+commands, MCP calls, file changes and other tool activity. `Estimated Thread
+Cost ($)` graphs the backend's dollar estimate on every track, while `Estimated
+Total Cost ($)` combines the root and spawned agents on the root track. Their
+endpoints are the exact backend estimates; the curve between them is distributed
+over the cumulative usage snapshots recorded in the rollout. Token and credit
+details stay inside profile markers rather than adding columns to the compact
 session table.
 
 ## Use as a library

@@ -37,7 +37,13 @@ const tree = [{
   })]
 }];
 
-const profile = createCodexProfile(tree, { credits: 12.5, cost: 1.25 });
+const billing = new Map([
+  ['root', { estimated_usage_credits_micros: 10000000,
+    estimated_usage_usd_micros: 1000000 }],
+  ['child', { estimated_usage_credits_micros: 2500000,
+    estimated_usage_usd_micros: 250000 }]
+]);
+const profile = createCodexProfile(tree, billing);
 assert.strictEqual(profile.meta.product, 'Codex');
 assert.strictEqual(profile.meta.version, 64);
 assert.deepStrictEqual(profile.threads.map(thread => thread.name), ['Root thread', 'Search agent']);
@@ -49,7 +55,14 @@ assert(names(profile.threads[0]).includes('Subagent'));
 assert(names(profile.threads[1]).includes('Reasoning'));
 
 const usage = profile.threads[0].markers.data.find(marker => marker.type === 'Usage');
-assert.deepStrictEqual([usage.totalTokens, usage.credits, usage.cost], [100, 12.5, 1.25]);
+assert.deepStrictEqual([usage.totalTokens, usage.credits, usage.cost], [100, 10, 1]);
+const threadCosts = profile.threads[0].markers.data
+  .filter(marker => marker.type === 'EstimatedThreadCost');
+const totalCosts = profile.threads[0].markers.data
+  .filter(marker => marker.type === 'EstimatedTotalCost');
+assert.strictEqual(threadCosts.at(-1).cost, 1);
+assert.strictEqual(totalCosts.at(-1).cost, 1.25);
+assert(profile.meta.markerSchema.find(schema => schema.name === 'EstimatedThreadCost').graphs);
 assert(profile.threads[0].markers.startTime.every(Number.isFinite));
 assert(profile.threads[0].markers.endTime.every(Number.isFinite));
 

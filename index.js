@@ -2021,16 +2021,16 @@ function codexSessionStamp(id) {
 }
 
 async function buildCodexProfile(id) {
-  const { sessionTree, addBillingEstimates } = require('./codex-backend.js');
+  const { sessionTree, fetchBillingEstimates } = require('./codex-backend.js');
   const tree = sessionTree(id);
   if (!tree) throw new Error(`Unknown Codex session ${id}`);
 
-  // Cost is an aggregate across this root and all spawned agents, matching the
-  // picker. The profile keeps it as marker metadata rather than adding another
-  // always-visible table column.
-  const root = tree.find(track => !track.session.parentId)?.session || tree[0].session;
-  const billing = { ...root, billingThreadIds: tree.map(track => track.session.id) };
-  await addBillingEstimates([billing]);
+  // Keep the authoritative estimate for every thread: the profile uses these
+  // to draw both per-thread dollars and a session-wide total on the root.
+  const billing = await fetchBillingEstimates(tree.map(track => track.session.id));
+  if (billing.size !== tree.length) {
+    throw new Error(`Billing API returned ${billing.size}/${tree.length} Codex thread estimates`);
+  }
   const { createCodexProfile } = require('./codex-profile.js');
   return Buffer.from(JSON.stringify(createCodexProfile(tree, billing)), 'utf8');
 }

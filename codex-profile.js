@@ -45,6 +45,42 @@ function usageOf(entries) {
   return usage || {};
 }
 
+function usageSnapshots(entries) {
+  const snapshots = [];
+  for (const entry of entries) {
+    let usage;
+    if (entry.type === 'token_usage_record') usage = entry.payload?.thread_token_usage;
+    if (entry.type === 'event_msg' && entry.payload?.type === 'token_count') {
+      usage = entry.payload.info?.total_token_usage;
+    }
+    const at = timestamp(entry.timestamp);
+    if (usage && at !== null) snapshots.push({ at, tokens: usage.total_tokens || 0 });
+  }
+  return snapshots;
+}
+
+function estimatedCostPoints(entries, estimate, trackStart, trackEnd) {
+  const dollars = estimate.estimated_usage_usd_micros / 1000000;
+  const credits = estimate.estimated_usage_credits_micros / 1000000;
+  const snapshots = usageSnapshots(entries);
+  const finalTokens = snapshots.at(-1)?.tokens || usageOf(entries).total_tokens || 0;
+  const points = [{ at: trackStart, cost: 0, credits: 0 }];
+
+  for (const snapshot of snapshots) {
+    const share = finalTokens > 0 ? Math.min(1, snapshot.tokens / finalTokens) : 0;
+    const point = { at: snapshot.at, cost: dollars * share, credits: credits * share };
+    if (points.at(-1).at === point.at) points[points.length - 1] = point;
+    else points.push(point);
+  }
+
+  // The endpoint is authoritative even if a final local usage record is
+  // missing or precedes the last event in the rollout.
+  const final = { at: trackEnd, cost: dollars, credits };
+  if (points.at(-1).at === trackEnd) points[points.length - 1] = final;
+  else points.push(final);
+  return points;
+}
+
 function markerSchemas() {
   return [
     { name: 'Text', tooltipLabel: '{marker.name}', tableLabel: '{marker.name}: {marker.data.text}',
@@ -76,6 +112,16 @@ function markerSchemas() {
         { key: 'credits', label: 'Estimated credits', format: 'decimal' },
         { key: 'cost', label: 'Estimated cost ($)', format: 'decimal' }
       ] },
+    { name: 'EstimatedThreadCost', tooltipLabel: '{marker.name}',
+      tableLabel: '{marker.name}: ${marker.data.cost}', display: [], fields: [
+        { key: 'cost', label: 'Thread cost ($)', format: 'decimal' },
+        { key: 'credits', label: 'Thread credits', format: 'decimal' }
+      ], graphs: [{ key: 'cost', color: 'blue', type: 'line' }] },
+    { name: 'EstimatedTotalCost', tooltipLabel: '{marker.name}',
+      tableLabel: '{marker.name}: ${marker.data.cost}', display: [], fields: [
+        { key: 'cost', label: 'Total cost ($)', format: 'decimal' },
+        { key: 'credits', label: 'Total credits', format: 'decimal' }
+      ], graphs: [{ key: 'cost', color: 'purple', type: 'line' }] },
     { name: 'Subagent', tooltipLabel: '{marker.data.title}', tableLabel: '{marker.data.title}',
       chartLabel: '{marker.name}', display: ['marker-chart', 'marker-table'], fields: [
         { key: 'title', label: 'Thread', format: 'string' },
@@ -109,8 +155,9 @@ function emptyShared(strings) {
   };
 }
 
-function createCodexProfile(tree, billing = {}) {
+function createCodexProfile(tree, billing) {
   if (!tree?.length) throw new Error('No Codex thread found');
+  if (!(billing instanceof Map)) throw new Error('Codex billing estimates are required');
   const allTimes = tree.flatMap(({ entries }) => entries.map(entry => timestamp(entry.timestamp)))
     .filter(time => time !== null);
   if (!allTimes.length) throw new Error('No timestamped events found in Codex rollout');
@@ -129,6 +176,33 @@ function createCodexProfile(tree, billing = {}) {
     return String(a.session.started).localeCompare(String(b.session.started));
   });
 
+  const costs = new Map();
+  const totalDeltas = [];
+  for (const track of tracks) {
+    const estimate = billing.get(track.session.id);
+    if (!estimate) throw new Error(`Missing dollar estimate for Codex thread ${track.session.id}`);
+    const times = track.entries.map(entry => timestamp(entry.timestamp)).filter(time => time !== null);
+    const points = estimatedCostPoints(track.entries, estimate, Math.min(...times), Math.max(...times));
+    costs.set(track.session.id, points);
+    let previousCost = 0;
+    let previousCredits = 0;
+    for (const point of points) {
+      totalDeltas.push({ at: point.at, cost: point.cost - previousCost,
+        credits: point.credits - previousCredits });
+      previousCost = point.cost;
+      previousCredits = point.credits;
+    }
+  }
+  totalDeltas.sort((a, b) => a.at - b.at);
+  let totalCost = 0;
+  let totalCredits = 0;
+  const totalPoints = totalDeltas.map(point => {
+    totalCost += point.cost;
+    totalCredits += point.credits;
+    return { at: point.at, cost: totalCost, credits: totalCredits };
+  });
+  const profileEnd = Math.max(...allTimes);
+
   const threads = tracks.map(({ session, entries }, index) => {
     const times = entries.map(entry => timestamp(entry.timestamp)).filter(time => time !== null);
     const trackStart = Math.min(...times);
@@ -142,6 +216,11 @@ function createCodexProfile(tree, billing = {}) {
       markers.category.push(category);
       markers.data.push(data);
       markers.length++;
+    };
+    const addCostGraph = (points, name, type, end) => {
+      points.forEach((point, pointIndex) => add(name, point.at,
+        points[pointIndex + 1]?.at ?? end, 0,
+        { type, cost: point.cost, credits: point.credits }));
     };
 
     const contextByTurn = new Map(entries.filter(e => e.type === 'turn_context')
@@ -197,17 +276,25 @@ function createCodexProfile(tree, billing = {}) {
         title: child.session.title, threadId: child.session.id });
     }
 
+    const estimate = billing.get(session.id);
     const usage = usageOf(entries);
     add('Usage', trackEnd, trackEnd, 0, { type: 'Usage',
       totalTokens: usage.total_tokens || 0, inputTokens: usage.input_tokens || 0,
       cachedTokens: usage.cached_input_tokens || 0, outputTokens: usage.output_tokens || 0,
-      credits: index === 0 ? billing.credits : undefined,
-      cost: index === 0 ? billing.cost : undefined });
+      credits: estimate.estimated_usage_credits_micros / 1000000,
+      cost: estimate.estimated_usage_usd_micros / 1000000 });
+    addCostGraph(costs.get(session.id), 'Estimated Thread Cost ($)',
+      'EstimatedThreadCost', trackEnd);
+    if (index === 0) {
+      addCostGraph(totalPoints, 'Estimated Total Cost ($)', 'EstimatedTotalCost', profileEnd);
+    }
 
     return {
       processType: 'default', processName: session.cwd || 'Codex',
-      processStartupTime: trackStart - startTime, processShutdownTime: trackEnd - startTime,
-      registerTime: trackStart - startTime, unregisterTime: trackEnd - startTime,
+      processStartupTime: trackStart - startTime,
+      processShutdownTime: (index === 0 ? profileEnd : trackEnd) - startTime,
+      registerTime: trackStart - startTime,
+      unregisterTime: (index === 0 ? profileEnd : trackEnd) - startTime,
       pausedRanges: [], showMarkersInTimeline: true, name: session.title,
       isMainThread: true, pid: index, tid: index,
       samples: { length: 0, stack: [], time: [], weight: [], weightType: 'samples' }, markers

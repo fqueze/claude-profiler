@@ -303,17 +303,17 @@ function billingAuth(root) {
 // deliberately best-effort: local history remains useful when offline, when
 // auth is stored somewhere other than auth.json, or when an old thread is no
 // longer available to the billing service.
-async function addBillingEstimates(sessions, {
+async function fetchBillingEstimates(ids, {
   root = codexDir(), fetchImpl = globalThis.fetch
 } = {}) {
-  if (process.env.CLAUDE_PROFILER_OFFLINE === '1') return sessions;
-  const auth = billingAuth(root);
-  if (!auth || typeof fetchImpl !== 'function') return sessions;
-
-  const ids = [...new Set(sessions.flatMap(session => session.billingThreadIds))];
   const estimates = new Map();
-  for (let offset = 0; offset < ids.length; offset += THREAD_USAGE_BATCH_SIZE) {
-    const batch = ids.slice(offset, offset + THREAD_USAGE_BATCH_SIZE);
+  if (process.env.CLAUDE_PROFILER_OFFLINE === '1') return estimates;
+  const auth = billingAuth(root);
+  if (!auth || typeof fetchImpl !== 'function') return estimates;
+
+  const uniqueIds = [...new Set(ids)];
+  for (let offset = 0; offset < uniqueIds.length; offset += THREAD_USAGE_BATCH_SIZE) {
+    const batch = uniqueIds.slice(offset, offset + THREAD_USAGE_BATCH_SIZE);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), THREAD_USAGE_TIMEOUT_MS);
     try {
@@ -338,7 +338,8 @@ async function addBillingEstimates(sessions, {
         continue;
       }
       for (const row of body.threads) {
-        if (Number.isSafeInteger(row.estimated_usage_credits_micros)) {
+        if (Number.isSafeInteger(row.estimated_usage_credits_micros) &&
+            Number.isSafeInteger(row.estimated_usage_usd_micros)) {
           estimates.set(row.thread_id, row);
         }
       }
@@ -348,6 +349,12 @@ async function addBillingEstimates(sessions, {
       clearTimeout(timeout);
     }
   }
+  return estimates;
+}
+
+async function addBillingEstimates(sessions, options = {}) {
+  const estimates = await fetchBillingEstimates(
+    sessions.flatMap(session => session.billingThreadIds), options);
 
   for (const session of sessions) {
     const rows = session.billingThreadIds.map(id => estimates.get(id));
@@ -357,10 +364,8 @@ async function addBillingEstimates(sessions, {
     const creditsMicros = rows.reduce(
       (sum, row) => sum + row.estimated_usage_credits_micros, 0);
     session.credits = creditsMicros / 1000000;
-    if (rows.every(row => Number.isSafeInteger(row.estimated_usage_usd_micros))) {
-      session.cost = rows.reduce(
-        (sum, row) => sum + row.estimated_usage_usd_micros, 0) / 1000000;
-    }
+    session.cost = rows.reduce(
+      (sum, row) => sum + row.estimated_usage_usd_micros, 0) / 1000000;
   }
   return sessions;
 }
@@ -375,6 +380,7 @@ module.exports = {
   listSessions,
   listSessionsWithUsage,
   addBillingEstimates,
+  fetchBillingEstimates,
   summarizeSession,
   sessionTitles,
   sessionTree

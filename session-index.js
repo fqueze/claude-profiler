@@ -40,6 +40,23 @@ function formatCost(cost) {
   return cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`;
 }
 
+function formatTokens(tokens) {
+  if (!(tokens > 0)) return '—';
+  return Math.round(tokens).toLocaleString('en-US');
+}
+
+function usageTitle(session) {
+  if (!session.usage) return '';
+  const uncached = Math.max(0,
+    (session.usage.input_tokens || 0) - (session.usage.cached_input_tokens || 0));
+  return [
+    `Uncached input: ${formatTokens(uncached)}`,
+    `Cached input: ${formatTokens(session.usage.cached_input_tokens)}`,
+    `Output (including reasoning): ${formatTokens(session.usage.output_tokens)}`,
+    `Reasoning portion: ${formatTokens(session.usage.reasoning_output_tokens)}`
+  ].join(' · ');
+}
+
 function formatDuration(ms) {
   if (!(ms > 0)) return '—';
 
@@ -84,18 +101,23 @@ function costBar(cost, maxCost) {
 }
 
 function sessionRow(session, maxCost) {
+  const provider = session.provider || 'claude';
+  const providerLabel = provider === 'codex' ? 'Codex' : 'Claude';
   const cells = [
     `<td class="title">
-       <span class="dot s${session.colorSlot}"></span>${escapeHtml(session.title)}
+       <span class="dot s${session.colorSlot}"></span><span class="provider ${provider}">${providerLabel}</span>${escapeHtml(session.title)}
      </td>`,
-    `<td class="date" data-value="${escapeHtml(session.ended || '')}"></td>`,
+    `<td class="date" data-value="${escapeHtml(session.started || '')}"></td>`,
     `<td class="num">${formatDuration(session.active)}</td>`,
     `<td class="num">${session.messages.toLocaleString()}</td>`,
     `<td class="num">${session.subagents || '—'}</td>`,
     `<td class="num">${formatBytes(session.bytes)}</td>`,
+    `<td class="num tokens" title="${escapeHtml(usageTitle(session))}">${formatTokens(session.tokens)}</td>`,
     `<td class="num cost">${formatCost(session.cost)}</td>`,
     `<td class="action">
-       <button type="button" data-id="${escapeHtml(session.id)}">Profiler</button>
+       ${session.profileAvailable === false
+         ? '<span class="unavailable">—</span>'
+         : `<button type="button" data-id="${escapeHtml(session.id)}">Profiler</button>`}
      </td>`
   ];
 
@@ -103,12 +125,13 @@ function sessionRow(session, maxCost) {
   // rather than by the formatted text ("9 MB" would sort above "10 MB").
   const keys = [
     session.title.toLowerCase(),
-    session.ended || '',
+    session.started || '',
     session.active,
     session.messages,
     session.subagents,
     session.bytes,
-    session.cost,
+    session.tokens ?? '',
+    session.cost ?? '',
     0
   ];
 
@@ -128,6 +151,8 @@ function sessionRow(session, maxCost) {
     <tr class="path">
       <td colspan="${COLUMNS.length - 3}">${escapeHtml(session.cwd)}${
         session.gitBranch ? ` · ${escapeHtml(session.gitBranch)}` : ''
+      }${
+        session.model ? ` · ${escapeHtml(session.model)}` : ''
       }</td>
       <td class="meter" colspan="2">
         <span class="bar ${costBand(session.cost)}"
@@ -140,12 +165,13 @@ function sessionRow(session, maxCost) {
 
 const COLUMNS = [
   { label: 'Session', className: 'title' },
-  { label: 'Last active', className: 'date' },
+  { label: 'Started', className: 'date' },
   { label: 'Active', className: 'num' },
   { label: 'Messages', className: 'num' },
   { label: 'Sub-agents', className: 'num' },
   { label: 'Size', className: 'num' },
-  { label: 'Cost', className: 'num cost' },
+  { label: 'Codex tokens', className: 'num tokens' },
+  { label: 'Claude cost', className: 'num cost' },
   { label: '', className: 'action', unsortable: true }
 ];
 
@@ -159,12 +185,13 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   assignProjectColors(sessions);
 
   const totalCost = sessions.reduce((sum, session) => sum + session.cost, 0);
+  const totalTokens = sessions.reduce((sum, session) => sum + (session.tokens || 0), 0);
   const totalBytes = sessions.reduce((sum, session) => sum + session.bytes, 0);
   const maxCost = sessions.reduce((max, session) => Math.max(max, session.cost), 0);
 
   return `<!DOCTYPE html>
 <meta charset="utf-8">
-<title>Claude sessions${host ? ` on ${escapeHtml(host)}` : ''}</title>
+<title>Claude and Codex sessions${host ? ` on ${escapeHtml(host)}` : ''}</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -250,6 +277,14 @@ function renderPage(sessions, { size = false, host = null } = {}) {
     display: inline-block; width: .5rem; height: .5rem; border-radius: 50%;
     margin-right: .45rem; vertical-align: baseline; flex: none;
   }
+  .provider {
+    display: inline-block; margin-right: .5rem; padding: .05rem .35rem;
+    border: 1px solid var(--line); border-radius: 3px;
+    color: var(--dim); font-size: .72rem; font-weight: 650;
+    line-height: 1.35; text-transform: uppercase; vertical-align: .05rem;
+  }
+  .provider.codex { color: light-dark(#086b53, #65d6b5); }
+  .provider.claude { color: light-dark(#91451d, #f09a68); }
   .s0 { background: var(--s0); } .s1 { background: var(--s1); }
   .s2 { background: var(--s2); } .s3 { background: var(--s3); }
   .s4 { background: var(--s4); } .s5 { background: var(--s5); }
@@ -272,6 +307,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   .bar.warning { background: var(--cost-warning); }
   .bar.critical { background: var(--cost-critical); }
   td.action { text-align: right; }
+  .unavailable { color: var(--dim); }
   /* A fixed width, so that nothing in the button's own state can reflow the
      table: the label never changes, and the busy state is drawn inside it. */
   button {
@@ -291,17 +327,18 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   h1 .host { color: var(--accent); }
 </style>
 
-<h1>Claude sessions${host ? ` on <span class="host">${escapeHtml(host)}</span>` : ''}</h1>
+<h1>Claude and Codex sessions${host ? ` on <span class="host">${escapeHtml(host)}</span>` : ''}</h1>
 <div class="summary">
   <strong>${sessions.length}</strong> session${sessions.length === 1 ? '' : 's'} ·
   <strong>${formatBytes(totalBytes)}</strong> ·
-  <strong class="total">${formatCost(totalCost)}</strong> total
+  <strong class="total">${formatCost(totalCost)}</strong> Claude total ·
+  <strong>${formatTokens(totalTokens)}</strong> Codex tokens
 </div>
 
 <div class="options">
   <label>
     <input type="checkbox" id="size"${size ? ' checked' : ''}>
-    Profile what fills the context window
+    Profile what fills the Claude context window
   </label>
   <span class="hint">(the <code>--size</code> profile, instead of the timeline)</span>
 
@@ -314,7 +351,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 </div>
 
 ${sessions.length === 0
-  ? `<p class="empty">No sessions found under ~/.claude/projects/${host ? ` on ${escapeHtml(host)}` : ''}.</p>`
+  ? `<p class="empty">No Claude or Codex sessions found${host ? ` on ${escapeHtml(host)}` : ''}.</p>`
   : `<div class="scroll"><table>
   <thead><tr>${header}</tr></thead>
   ${sessions.map(session => sessionRow(session, maxCost)).join('')}
@@ -414,6 +451,7 @@ module.exports = {
   renderPage,
   formatBytes,
   formatCost,
+  formatTokens,
   formatDuration,
   projectLabel
 };

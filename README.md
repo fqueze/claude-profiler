@@ -1,15 +1,15 @@
 # claude-profiler
 
-Turns a Claude Code session log into a [Firefox Profiler](https://profiler.firefox.com)
-profile, so a conversation can be read as a timeline: what the model was doing,
-which tools ran and for how long, what the sub-agents were up to, and where the
-tokens and the money went.
+Lists Claude Code and Codex sessions together, and turns a Claude Code session
+log into a [Firefox Profiler](https://profiler.firefox.com) profile. The list
+shows where the time, tokens, and money went; a Claude profile shows what the
+model was doing, which tools ran and for how long, and what the sub-agents were
+up to.
 
-Claude Code writes every session to a [JSONL file](JSONL_FORMAT.md) under
-`~/.claude/projects/`. Those files hold timestamps, token usage and tool calls,
-but reading them by hand doesn't show how a session actually unfolded. The
-profiler already knows how to display concurrent tracks, interval markers and
-counter graphs over a shared timeline, which is exactly the shape of this data.
+Claude Code writes sessions under `~/.claude/projects/`; Codex writes them under
+`~/.codex/sessions/`. Both hold timestamps and usage data, but reading JSONL by
+hand does not make sessions easy to compare. The picker normalizes both formats
+into one start-time-sorted page and labels every row by provider.
 
 ## Install
 
@@ -36,11 +36,11 @@ list in a browser, so there is no file to go looking for:
 claude-profiler
 ```
 
-Each row is a session — what it was about, where it ran, when it was last
-active, how long it actually worked, and what it cost — and the **Profiler**
-button on it builds the profile and opens it. Sort by any column to find the
-session worth looking at: the expensive one, the long one, the one with the
-sub-agents.
+Each row is a session — what it was about, where it ran, when it started, how
+long it actually worked, and its measured usage. Claude rows report estimated
+dollar cost and have a **Profiler** button. Codex rows report exact recorded
+tokens; Codex profiles are not built yet. Sort by any column to find the session
+worth looking at: the expensive one, the long one, the one with sub-agents.
 
 To look at another machine instead, give its name. Anything you can `ssh`
 into works, and the sessions are listed and profiled the same way:
@@ -64,12 +64,18 @@ Session list at http://127.0.0.1:64761/
 Press Ctrl+C to stop.
 ```
 
-The page is a table of every session under `~/.claude/projects/`, most recently
-active first. A row carries the title Claude Code gave the session, its working
-directory and branch, when it was last active, how much of that time it spent
-working rather than waiting, its message and sub-agent counts, its size on disk
-and what it cost — with a coloured bar banding the cost so the expensive
-sessions are visible without reading the figures.
+The page interleaves sessions under `~/.claude/projects/` and
+`~/.codex/sessions/`, newest start first. A row carries its provider, title,
+working directory and branch, start time, active time, message and sub-agent
+counts, size on disk, token count where available, and dollar cost where
+available. Claude cost is banded so expensive sessions stand out.
+
+Codex JSONL does not contain a dollar amount or consumed-credit amount. Its
+`rate_limits.credits` object only records whether credits are enabled and the
+balance is null in the observed files. The page therefore reports the durable
+quantity the logs do contain: cumulative total tokens. Hovering the number
+shows uncached input, cached input, output, and reasoning-output counts so an
+enterprise rate can be applied separately without losing the billing split.
 
 Clicking a column header sorts by it, so "which session cost the most" and
 "which one ran the most sub-agents" are one click each. The checkbox at the top

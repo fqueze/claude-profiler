@@ -87,11 +87,13 @@ check('a listed session carries what the table needs',
 // otherwise re-profiling the session being worked in serves the profile from
 // before it was worked in.
 if (listed.sessions.length > 0) {
-  const id = listed.sessions[0].id;
-  const first = JSON.parse(json(['--json', 'stamp', id]));
-  check('stamp answers with a number', typeof first.stamp, 'number');
-  check('stamp is the same for an unchanged session',
-    JSON.parse(json(['--json', 'stamp', id])).stamp, first.stamp);
+  const id = listed.sessions.find(session => session.profileAvailable !== false)?.id;
+  if (id) {
+    const first = JSON.parse(json(['--json', 'stamp', id]));
+    check('stamp answers with a number', typeof first.stamp, 'number');
+    check('stamp is the same for an unchanged session',
+      JSON.parse(json(['--json', 'stamp', id])).stamp, first.stamp);
+  }
 }
 
 check('stamp answers null for a session that is not there',
@@ -110,13 +112,13 @@ const local = renderPage(sessions, {});
 const remote = renderPage(sessions, { host: 'm4' });
 
 check('the local page does not name a host',
-  /<h1>Claude sessions<\/h1>/.test(local), true);
+  /<h1>Claude and Codex sessions<\/h1>/.test(local), true);
 
 check('the remote page names the host in the heading',
-  /<h1>Claude sessions on <span class="host">m4<\/span><\/h1>/.test(remote), true);
+  /<h1>Claude and Codex sessions on <span class="host">m4<\/span><\/h1>/.test(remote), true);
 
 check('the remote page names the host in the title',
-  /<title>Claude sessions on m4<\/title>/.test(remote), true);
+  /<title>Claude and Codex sessions on m4<\/title>/.test(remote), true);
 
 // A host is a name from the command line, and it is interpolated into HTML.
 const injected = renderPage(sessions, { host: '<script>alert(1)</script>' });

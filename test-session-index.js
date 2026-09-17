@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const {
   findSessionFiles, listSessions, renderPage, formatBytes, formatCost,
-  formatDuration, projectLabel
+  formatDuration, formatTokens, projectLabel
 } = require('./session-index.js');
 
 let failures = 0;
@@ -133,6 +133,9 @@ check('formats bytes', [formatBytes(512), formatBytes(2048), formatBytes(5 << 20
 check('formats cost, and says nothing for a free session',
   [formatCost(0), formatCost(0.004), formatCost(12.5)], ['—', '<$0.01', '$12.50']);
 
+check('formats exact Codex token counts',
+  [formatTokens(0), formatTokens(1234567)], ['—', '1,234,567']);
+
 check('formats a duration in hours and minutes', formatDuration(3900000), '1h 5m');
 
 check('turns a project directory name back into a path',
@@ -146,13 +149,13 @@ const html = renderPage(sessions);
 // page's `dataset['sort' + column]` found nothing and no column ever sorted.
 const sortAttributes = [...html.matchAll(/data-sort(\d+)=/g)].map(m => m[1]);
 check('rows carry the sort keys the script reads',
-  [...new Set(sortAttributes)].sort(), ['0', '1', '2', '3', '4', '5', '6', '7']);
+  [...new Set(sortAttributes)].sort(), ['0', '1', '2', '3', '4', '5', '6', '7', '8']);
 
 check('the script reads the attribute the rows actually carry',
   html.includes("getAttribute('data-sort' + column)"), true);
 
 // Sorting has to be on the numbers: "9 MB" sorts above "10 MB" as text.
-const costKeys = [...html.matchAll(/data-sort6="([^"]*)"/g)].map(m => m[1]);
+const costKeys = [...html.matchAll(/data-sort7="([^"]*)"/g)].map(m => m[1]);
 check('the cost sort key is the raw number, not the formatted figure',
   costKeys.every(k => k !== '' && !isNaN(k)), true);
 
@@ -160,11 +163,9 @@ check('the size sort key is a byte count',
   [...html.matchAll(/data-sort5="([^"]*)"/g)].map(m => m[1]).every(k => !isNaN(k)),
   true);
 
-// The column is the last activity, not the start: the session someone wants is
-// the one they were just in.
-check('the date column sorts on when the session was last active',
+check('the date column sorts on when the session started',
   [...html.matchAll(/data-sort1="([^"]*)"/g)].map(m => m[1]),
-  [sessions[0].ended, sessions[1].ended]);
+  [sessions[0].started, sessions[1].started]);
 
 // The first sort() call must not reverse a sort that has not happened yet.
 check('no column is marked sorted before the first sort',
@@ -175,6 +176,21 @@ check('every row has a button carrying its session id',
   ['aaaa', 'bbbb']);
 
 check('the page offers the --size option', html.includes('id="size"'), true);
+
+check('Claude rows are labeled', html.includes('provider claude">Claude'), true);
+
+check('a Codex row is labeled, reports tokens, and offers no Claude profile', (() => {
+  const page = renderPage([{
+    ...sessions[0], provider: 'codex', id: 'codex', tokens: 1234, cost: null,
+    profileAvailable: false, usage: {
+      input_tokens: 1200, cached_input_tokens: 1000, output_tokens: 34,
+      reasoning_output_tokens: 12
+    }
+  }]);
+  return page.includes('provider codex">Codex') &&
+    page.includes('>1,234</td>') && !page.includes('data-id="codex"') &&
+    page.includes('Cached input: 1,000');
+})(), true);
 
 check('a title with markup in it is escaped', (() => {
   writeSession('-Users-me-buildgit-x', 'xss', [
@@ -217,7 +233,8 @@ check('the script reorders the groups', html.includes('table.append(...sorted)')
 // few characters wide in a narrow window and breaks a path down it.
 check('the path is a full-width row under the figures',
   new RegExp(`<tr class="path">\\s*<td colspan="${
-    ['Session','Last active','Active','Messages','Sub-agents','Size','Cost','']
+    ['Session','Started','Active','Messages','Sub-agents','Size',
+      'Codex tokens','Claude cost','']
       .length - 3}"`).test(html), true);
 
 check('the path row carries the working directory and branch',

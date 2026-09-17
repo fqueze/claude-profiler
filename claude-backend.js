@@ -135,6 +135,7 @@ function summarizeSession({ project, file }, deps) {
   const messages = conversationEntries(entries);
 
   return {
+    provider: 'claude',
     id: path.basename(file, '.jsonl'),
     file,
     project,
@@ -151,7 +152,9 @@ function summarizeSession({ project, file }, deps) {
     entries: entries.length,
     bytes: (stat?.size || 0) + agents.bytes,
     subagents: agents.count,
-    cost: totalCost(messages)
+    cost: totalCost(messages),
+    tokens: null,
+    profileAvailable: true
   };
 }
 

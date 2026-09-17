@@ -4,7 +4,7 @@ const os = require('os');
 const path = require('path');
 const {
   findSessionFiles, listSessions, summarizeSession, sessionTitles,
-  addBillingEstimates
+  addBilling
 } = require('./codex-backend.js');
 
 let failures = 0;
@@ -93,7 +93,7 @@ check('reads the final cumulative usage snapshot', summary.usage, {
   input_tokens: 90, cached_input_tokens: 40, cache_write_input_tokens: 0,
   output_tokens: 10, reasoning_output_tokens: 3, total_tokens: 100
 });
-check('reports the Codex provider and no dollar estimate',
+check('reports the Codex provider and no dollar cost',
   [summary.provider, summary.cost], ['codex', null]);
 check('reports the model needed to apply a rate', summary.model, 'gpt-test');
 
@@ -106,7 +106,7 @@ check('the session index title wins', sessions[0].title, 'Indexed title');
 
 const billingCheck = (async () => {
   let requested;
-  await addBillingEstimates(sessions, { root, fetchImpl: async (url, options) => {
+  await addBilling(sessions, { root, fetchImpl: async (url, options) => {
     requested = { url, options };
     return {
       ok: true,
@@ -128,7 +128,7 @@ const billingCheck = (async () => {
     'https://chatgpt.com/backend-api/wham/usage/thread_usage/query',
     'Bearer test-access-token', 'test-account', ['child', 'root']
   ]);
-  check('adds root and subagent billing estimates',
+  check('adds root and subagent billing totals',
     [sessions[0].credits, sessions[0].cost], [48, 2]);
 
   fs.rmSync(root, { recursive: true, force: true });

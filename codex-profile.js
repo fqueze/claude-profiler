@@ -137,9 +137,9 @@ function transcriptEvents(entries) {
   return events.sort((a, b) => a.at - b.at);
 }
 
-function estimatedCostPoints(entries, estimate, trackStart, trackEnd) {
-  const dollars = estimate.estimated_usage_usd_micros / 1000000;
-  const credits = estimate.estimated_usage_credits_micros / 1000000;
+function costPoints(entries, billing, trackStart, trackEnd) {
+  const dollars = billing.estimated_usage_usd_micros / 1000000;
+  const credits = billing.estimated_usage_credits_micros / 1000000;
   const snapshots = usageSnapshots(entries);
   const finalTokens = snapshots.at(-1)?.tokens || usageOf(entries).total_tokens || 0;
   const points = [{ at: trackStart, cost: 0, credits: 0 }];
@@ -175,7 +175,7 @@ function markerSchemas() {
       tableLabel: '{marker.name}: {marker.data.prompt}', chartLabel: '{marker.data.prompt}',
       display: ['marker-chart', 'marker-table', 'timeline-overview'], fields: [
         { key: 'prompt', label: 'Prompt', format: 'string' },
-        { key: 'cost', label: 'Estimated cost ($)', format: 'decimal' }
+        { key: 'cost', label: 'Cost ($)', format: 'decimal' }
       ] },
     { name: 'Intervention', tooltipLabel: '{marker.name}',
       tableLabel: '{marker.name}: {marker.data.text}', chartLabel: '{marker.name}',
@@ -223,22 +223,22 @@ function markerSchemas() {
         { key: 'inputTokens', label: 'Input tokens', format: 'integer' },
         { key: 'cachedTokens', label: 'Cached input', format: 'integer' },
         { key: 'outputTokens', label: 'Output tokens', format: 'integer' },
-        { key: 'credits', label: 'Estimated credits', format: 'decimal' },
-        { key: 'cost', label: 'Estimated cost ($)', format: 'decimal' }
+        { key: 'credits', label: 'Credits', format: 'decimal' },
+        { key: 'cost', label: 'Cost ($)', format: 'decimal' }
       ] },
-    { name: 'EstimatedThreadCost', tooltipLabel: '{marker.name}',
+    { name: 'ThreadCost', tooltipLabel: '{marker.name}',
       tableLabel: '{marker.name}: ${marker.data.cost}', display: [], fields: [
         { key: 'cost', label: 'Thread cost ($)', format: 'decimal' },
         { key: 'credits', label: 'Thread credits', format: 'decimal' }
       ], graphs: [{ key: 'cost', color: 'blue', type: 'line' }] },
-    { name: 'EstimatedResponseCost', tooltipLabel: '{marker.name}',
+    { name: 'ResponseCost', tooltipLabel: '{marker.name}',
       tableLabel: '{marker.name}: ${marker.data.cost}', display: [], fields: [
         { key: 'cost', label: 'Response cost ($)', format: 'decimal' },
         { key: 'inputTokens', label: 'Context tokens', format: 'integer' },
         { key: 'cachedInputTokens', label: 'Cached input', format: 'integer' },
         { key: 'outputTokens', label: 'Output tokens', format: 'integer' }
       ], graphs: [{ key: 'cost', color: 'orange', type: 'bar' }] },
-    { name: 'EstimatedTotalCost', tooltipLabel: '{marker.name}',
+    { name: 'TotalCost', tooltipLabel: '{marker.name}',
       tableLabel: '{marker.name}: ${marker.data.cost}', display: [], fields: [
         { key: 'cost', label: 'Total cost ($)', format: 'decimal' },
         { key: 'credits', label: 'Total credits', format: 'decimal' }
@@ -294,7 +294,7 @@ function createShared(strings, intern) {
 
 function createCodexProfile(tree, billing) {
   if (!tree?.length) throw new Error('No Codex thread found');
-  if (!(billing instanceof Map)) throw new Error('Codex billing estimates are required');
+  if (!(billing instanceof Map)) throw new Error('Codex billing data is required');
   const allTimes = tree.flatMap(({ entries }) => entries.map(entry => timestamp(entry.timestamp)))
     .filter(time => time !== null);
   if (!allTimes.length) throw new Error('No timestamped events found in Codex rollout');
@@ -317,10 +317,10 @@ function createCodexProfile(tree, billing) {
   const costs = new Map();
   const totalDeltas = [];
   for (const track of tracks) {
-    const estimate = billing.get(track.session.id);
-    if (!estimate) throw new Error(`Missing dollar estimate for Codex thread ${track.session.id}`);
+    const billingRow = billing.get(track.session.id);
+    if (!billingRow) throw new Error(`Missing dollar cost for Codex thread ${track.session.id}`);
     const times = track.entries.map(entry => timestamp(entry.timestamp)).filter(time => time !== null);
-    const points = estimatedCostPoints(track.entries, estimate, Math.min(...times), Math.max(...times));
+    const points = costPoints(track.entries, billingRow, Math.min(...times), Math.max(...times));
     costs.set(track.session.id, points);
     let previousCost = 0;
     let previousCredits = 0;
@@ -533,8 +533,8 @@ function createCodexProfile(tree, billing) {
       add('Output Tokens', responseStart, response.at, 5, { type: 'OutputTokens',
         tokens: usage.output_tokens || 0,
         reasoningTokens: usage.reasoning_output_tokens || 0 });
-      add('Estimated Response Cost ($)', responseStart, response.at, 5, {
-        type: 'EstimatedResponseCost',
+      add('Response Cost ($)', responseStart, response.at, 5, {
+        type: 'ResponseCost',
         cost: Math.max(0, costAt(response.at) - costAt(previous)),
         inputTokens: usage.input_tokens || 0,
         cachedInputTokens: usage.cached_input_tokens || 0,
@@ -569,17 +569,17 @@ function createCodexProfile(tree, billing) {
       }
     }
 
-    const estimate = billing.get(session.id);
+    const billingRow = billing.get(session.id);
     const usage = usageOf(entries);
     add('Usage', trackEnd, trackEnd, 0, { type: 'Usage',
       totalTokens: usage.total_tokens || 0, inputTokens: usage.input_tokens || 0,
       cachedTokens: usage.cached_input_tokens || 0, outputTokens: usage.output_tokens || 0,
-      credits: estimate.estimated_usage_credits_micros / 1000000,
-      cost: estimate.estimated_usage_usd_micros / 1000000 });
-    addCostGraph(costs.get(session.id), 'Estimated Thread Cost ($)',
-      'EstimatedThreadCost', trackEnd);
+      credits: billingRow.estimated_usage_credits_micros / 1000000,
+      cost: billingRow.estimated_usage_usd_micros / 1000000 });
+    addCostGraph(costs.get(session.id), 'Thread Cost ($)',
+      'ThreadCost', trackEnd);
     if (index === 0) {
-      addCostGraph(totalPoints, 'Estimated Total Cost ($)', 'EstimatedTotalCost', profileEnd);
+      addCostGraph(totalPoints, 'Total Cost ($)', 'TotalCost', profileEnd);
     }
 
     return {

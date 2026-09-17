@@ -151,7 +151,7 @@ const COLUMNS = [
   { label: 'Messages', className: 'num' },
   { label: 'Sub-agents', className: 'num' },
   { label: 'Size', className: 'num' },
-  { label: 'Est. cost', className: 'num cost' },
+  { label: 'Cost', className: 'num cost' },
   { label: '', className: 'action', unsortable: true }
 ];
 

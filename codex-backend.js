@@ -298,18 +298,18 @@ function billingAuth(root) {
   }
 }
 
-// The same authoritative per-thread estimate that Codex exposes as
-// `thread-credits` and `estimated-thread-cost` in its status line. This is
+// The same authoritative per-thread billing data that Codex exposes in its
+// status line. This is
 // deliberately best-effort: local history remains useful when offline, when
 // auth is stored somewhere other than auth.json, or when an old thread is no
 // longer available to the billing service.
-async function fetchBillingEstimates(ids, {
+async function fetchBilling(ids, {
   root = codexDir(), fetchImpl = globalThis.fetch
 } = {}) {
-  const estimates = new Map();
-  if (process.env.CLAUDE_PROFILER_OFFLINE === '1') return estimates;
+  const billingById = new Map();
+  if (process.env.CLAUDE_PROFILER_OFFLINE === '1') return billingById;
   const auth = billingAuth(root);
-  if (!auth || typeof fetchImpl !== 'function') return estimates;
+  if (!auth || typeof fetchImpl !== 'function') return billingById;
 
   const uniqueIds = [...new Set(ids)];
   for (let offset = 0; offset < uniqueIds.length; offset += THREAD_USAGE_BATCH_SIZE) {
@@ -340,7 +340,7 @@ async function fetchBillingEstimates(ids, {
       for (const row of body.threads) {
         if (Number.isSafeInteger(row.estimated_usage_credits_micros) &&
             Number.isSafeInteger(row.estimated_usage_usd_micros)) {
-          estimates.set(row.thread_id, row);
+          billingById.set(row.thread_id, row);
         }
       }
     } catch {
@@ -349,15 +349,15 @@ async function fetchBillingEstimates(ids, {
       clearTimeout(timeout);
     }
   }
-  return estimates;
+  return billingById;
 }
 
-async function addBillingEstimates(sessions, options = {}) {
-  const estimates = await fetchBillingEstimates(
+async function addBilling(sessions, options = {}) {
+  const billingById = await fetchBilling(
     sessions.flatMap(session => session.billingThreadIds), options);
 
   for (const session of sessions) {
-    const rows = session.billingThreadIds.map(id => estimates.get(id));
+    const rows = session.billingThreadIds.map(id => billingById.get(id));
     // Omitted rows mean unavailable, not zero. Do not publish a partial total.
     if (rows.some(row => !row)) continue;
 
@@ -372,15 +372,15 @@ async function addBillingEstimates(sessions, options = {}) {
 
 async function listSessionsWithUsage(options = {}) {
   const sessions = listSessions(options);
-  return addBillingEstimates(sessions, options);
+  return addBilling(sessions, options);
 }
 
 module.exports = {
   findSessionFiles,
   listSessions,
   listSessionsWithUsage,
-  addBillingEstimates,
-  fetchBillingEstimates,
+  addBilling,
+  fetchBilling,
   summarizeSession,
   sessionTitles,
   sessionTree

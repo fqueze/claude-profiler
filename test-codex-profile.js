@@ -64,15 +64,15 @@ assert(names(profile.threads[0]).includes('Activity'));
 const usage = profile.threads[0].markers.data.find(marker => marker.type === 'Usage');
 assert.deepStrictEqual([usage.totalTokens, usage.credits, usage.cost], [100, 10, 1]);
 const threadCosts = profile.threads[0].markers.data
-  .filter(marker => marker.type === 'EstimatedThreadCost');
+  .filter(marker => marker.type === 'ThreadCost');
 const totalCosts = profile.threads[0].markers.data
-  .filter(marker => marker.type === 'EstimatedTotalCost');
+  .filter(marker => marker.type === 'TotalCost');
 const responseCosts = profile.threads[0].markers.data
-  .filter(marker => marker.type === 'EstimatedResponseCost');
+  .filter(marker => marker.type === 'ResponseCost');
 assert.strictEqual(threadCosts.at(-1).cost, 1);
 assert.strictEqual(totalCosts.at(-1).cost, 1.25);
 assert.strictEqual(responseCosts.reduce((sum, marker) => sum + marker.cost, 0), 1);
-assert(profile.meta.markerSchema.find(schema => schema.name === 'EstimatedThreadCost').graphs);
+assert(profile.meta.markerSchema.find(schema => schema.name === 'ThreadCost').graphs);
 assert(profile.meta.markerSchema.find(schema => schema.name === 'ContextSize').graphs);
 assert(profile.threads[0].samples.length > 0);
 assert.strictEqual(profile.threads[0].samples.weightType, 'bytes');

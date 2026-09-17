@@ -231,7 +231,7 @@ check('the script reorders the groups', html.includes('table.append(...sorted)')
 // few characters wide in a narrow window and breaks a path down it.
 check('the path is a full-width row under the figures',
   new RegExp(`<tr class="path">\\s*<td colspan="${
-    ['Session','Started','Active','Messages','Sub-agents','Size','Est. cost','']
+    ['Session','Started','Active','Messages','Sub-agents','Size','Cost','']
       .length - 3}"`).test(html), true);
 
 check('the path row carries the working directory and branch',

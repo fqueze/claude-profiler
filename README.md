@@ -38,7 +38,7 @@ claude-profiler
 Each row is a session — what it was about, where it ran, when it started, how
 long it actually worked, and its measured usage. Every row has a **Profiler**
 button. Claude rows report calculated dollar cost; for a signed-in Enterprise
-account, Codex rows report backend-estimated dollars.
+account, Codex rows report backend dollars.
 Sort by any column to find the session worth looking at: the expensive one, the
 long one, or the one with sub-agents.
 
@@ -67,14 +67,14 @@ Press Ctrl+C to stop.
 The page interleaves sessions under `~/.claude/projects/` and
 `~/.codex/sessions/`, newest start first. A row carries its provider, title,
 working directory and branch, start time, active time, message and sub-agent
-counts, size on disk, and estimated dollar cost. Cost is banded so expensive
+counts, size on disk, and dollar cost. Cost is banded so expensive
 sessions stand out.
 
 Codex JSONL does not contain a dollar amount or consumed-credit amount. Its
 `rate_limits.credits` object only records whether credits are enabled. When the
 local Codex login is available in `~/.codex/auth.json`, the picker uses the same
-authenticated per-thread usage endpoint as Codex's `thread-credits` and
-`estimated-thread-cost` status-line items. Spawned-agent estimates are included
+authenticated per-thread usage endpoint as Codex's credit and cost status-line
+items. Spawned-agent costs are included
 in their root session. The API is best-effort: when offline, signed out, or when
 the backend omits an old thread, the row leaves cost blank rather than treating
 unavailable billing data as zero. Locally recorded tokens remain available in
@@ -313,10 +313,10 @@ carry model, effort, input, cached-input, output and reasoning-token counts.
 Transcript contributions are source-linked weighted samples, so the call tree,
 flame graph, source view and idle-gap treatment work on Codex tracks too.
 
-`Estimated Response Cost ($)` shows individual responses, `Estimated Thread
-Cost ($)` shows the running estimate on every track, and `Estimated Total Cost
-($)` combines the root and spawned agents on the root track. Their endpoints
-are the exact backend dollar estimates; their distribution over time follows
+`Response Cost ($)` shows individual responses, `Thread Cost ($)` shows the
+running cost on every track, and `Total Cost ($)` combines the root and spawned
+agents on the root track. Their endpoints
+are the exact backend dollar amounts; their distribution over time follows
 the cumulative usage snapshots recorded in the rollout. Token and credit
 details stay inside profile markers rather than adding columns to the compact
 session table.

@@ -1983,7 +1983,7 @@ async function runJsonMode(command, id, options) {
 // path is over a second of work for something the directory listing already
 // knows.
 function sessionFileById(id) {
-  const { findSessionFiles } = require('./session-index.js');
+  const { findSessionFiles } = require('./claude-backend.js');
   return findSessionFiles().find(
     (entry) => path.basename(entry.file, '.jsonl') === id
   )?.file || null;
@@ -2106,7 +2106,7 @@ function startIndexServer(profilerOrigin, options = {}, source = localSource()) 
 // process. The methods are async only because the remote source's are, and the
 // server awaits both through the same code.
 function localSource() {
-  const { listSessions } = require('./session-index.js');
+  const { listSessions } = require('./claude-backend.js');
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };

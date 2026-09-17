@@ -22,6 +22,7 @@
     "size-profile.js",
     "shell-parse.js",
     "transcript.js",
+    "claude-backend.js",
     "session-index.js",
     "remote.js",
     "JSONL_FORMAT.md",

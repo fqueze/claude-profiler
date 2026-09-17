@@ -25,9 +25,12 @@ const tree = [{
       item: { type: 'CommandExecution', command: ['git', 'status'], status: 'completed',
         stdout: 'clean' } }),
     entry(1500, 'event_msg', { type: 'task_complete', turn_id: 'turn' }),
-    entry(1600, 'token_usage_record', { thread_token_usage: {
-      total_tokens: 100, input_tokens: 80, cached_input_tokens: 50, output_tokens: 20
-    } })
+    entry(1600, 'token_usage_record', { response_id: 'response', turn_id: 'turn',
+      usage: { total_tokens: 100, input_tokens: 80, cached_input_tokens: 50,
+        output_tokens: 20, reasoning_output_tokens: 8 },
+      thread_token_usage: {
+        total_tokens: 100, input_tokens: 80, cached_input_tokens: 50, output_tokens: 20
+      } })
   ]
 }, {
   session: session('child', 'root', 500, 'Search agent'),
@@ -53,6 +56,10 @@ assert(names(profile.threads[0]).includes('Turn'));
 assert(names(profile.threads[0]).includes('CommandExecution'));
 assert(names(profile.threads[0]).includes('Subagent'));
 assert(names(profile.threads[1]).includes('Reasoning'));
+assert(names(profile.threads[0]).includes('Context Size'));
+assert(names(profile.threads[0]).includes('Output Tokens'));
+assert(names(profile.threads[0]).includes('gpt-test'));
+assert(names(profile.threads[0]).includes('Activity'));
 
 const usage = profile.threads[0].markers.data.find(marker => marker.type === 'Usage');
 assert.deepStrictEqual([usage.totalTokens, usage.credits, usage.cost], [100, 10, 1]);
@@ -60,9 +67,17 @@ const threadCosts = profile.threads[0].markers.data
   .filter(marker => marker.type === 'EstimatedThreadCost');
 const totalCosts = profile.threads[0].markers.data
   .filter(marker => marker.type === 'EstimatedTotalCost');
+const responseCosts = profile.threads[0].markers.data
+  .filter(marker => marker.type === 'EstimatedResponseCost');
 assert.strictEqual(threadCosts.at(-1).cost, 1);
 assert.strictEqual(totalCosts.at(-1).cost, 1.25);
+assert.strictEqual(responseCosts.reduce((sum, marker) => sum + marker.cost, 0), 1);
 assert(profile.meta.markerSchema.find(schema => schema.name === 'EstimatedThreadCost').graphs);
+assert(profile.meta.markerSchema.find(schema => schema.name === 'ContextSize').graphs);
+assert(profile.threads[0].samples.length > 0);
+assert.strictEqual(profile.threads[0].samples.weightType, 'bytes');
+assert.strictEqual(profile.shared.sources.length, 2);
+assert(profile.shared.sources.content[0].includes('Hello'));
 assert(profile.threads[0].markers.startTime.every(Number.isFinite));
 assert(profile.threads[0].markers.endTime.every(Number.isFinite));
 

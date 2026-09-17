@@ -304,11 +304,20 @@ exactly; see [Known Limitations](JSONL_FORMAT.md#known-limitations).
 
 A Codex profile has one track for the root thread and one for every spawned
 agent. It includes logged turn spans, user and agent messages, reasoning,
-commands, MCP calls, file changes and other tool activity. `Estimated Thread
-Cost ($)` graphs the backend's dollar estimate on every track, while `Estimated
-Total Cost ($)` combines the root and spawned agents on the root track. Their
-endpoints are the exact backend estimates; the curve between them is distributed
-over the cumulative usage snapshots recorded in the rollout. Token and credit
+commands, MCP calls, file changes and other tool activity. It supports both the
+current item-completion format and older Codex event logs.
+
+As with Claude, the context and output-token graphs are sampled at every model
+response. Context distinguishes cached from uncached input, and model markers
+carry model, effort, input, cached-input, output and reasoning-token counts.
+Transcript contributions are source-linked weighted samples, so the call tree,
+flame graph, source view and idle-gap treatment work on Codex tracks too.
+
+`Estimated Response Cost ($)` shows individual responses, `Estimated Thread
+Cost ($)` shows the running estimate on every track, and `Estimated Total Cost
+($)` combines the root and spawned agents on the root track. Their endpoints
+are the exact backend dollar estimates; their distribution over time follows
+the cumulative usage snapshots recorded in the rollout. Token and credit
 details stay inside profile markers rather than adding columns to the compact
 session table.
 

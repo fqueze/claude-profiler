@@ -99,7 +99,7 @@ function sessionRow(session, maxCost) {
     `<td class="action">
        ${session.profileAvailable === false
          ? '<span class="unavailable">—</span>'
-         : `<button type="button" data-id="${escapeHtml(session.id)}">Profiler</button>`}
+         : `<button type="button" data-id="${escapeHtml(`${provider}:${session.id}`)}" data-provider="${provider}">Profiler</button>`}
      </td>`
   ];
 
@@ -391,7 +391,10 @@ ${sessions.length === 0
     const button = event.target.closest('button[data-id]');
     if (!button) return;
 
-    const size = document.getElementById('size').checked;
+    // Context-size profiling is a Claude transcript concept. Codex rows always
+    // open their activity timeline even when that page-wide option is checked.
+    const size = button.dataset.provider === 'claude' &&
+      document.getElementById('size').checked;
     button.disabled = true;
 
     // The tab is opened now, while the click is still what is running:

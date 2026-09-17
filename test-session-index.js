@@ -170,23 +170,23 @@ check('no column is marked sorted before the first sort',
 
 check('every row has a button carrying its session id',
   [...html.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]).sort(),
-  ['aaaa', 'bbbb']);
+  ['claude:aaaa', 'claude:bbbb']);
 
 check('the page offers the --size option', html.includes('id="size"'), true);
 
 check('Claude rows are labeled', html.includes('provider claude">Claude'), true);
 
-check('a Codex row is labeled, reports cost, and offers no Claude profile', (() => {
+check('a Codex row is labeled, reports cost, and offers its profiler', (() => {
   const page = renderPage([{
     ...sessions[0], provider: 'codex', id: 'codex', tokens: 1234,
     credits: 12.5, cost: 1.25,
-    profileAvailable: false, usage: {
+    profileAvailable: true, usage: {
       input_tokens: 1200, cached_input_tokens: 1000, output_tokens: 34,
       reasoning_output_tokens: 12
     }
   }]);
   return page.includes('provider codex">Codex') &&
-    page.includes('>$1.25</td>') && !page.includes('data-id="codex"') &&
+    page.includes('>$1.25</td>') && page.includes('data-id="codex:codex"') &&
     !page.includes('Codex tokens') && !page.includes('Codex credits');
 })(), true);
 
@@ -209,7 +209,7 @@ check('each project gets its own colour slot',
 check('colour follows the project, not the row order', (() => {
   const reversed = renderPage([...sessions].reverse());
   const forOne = (page, id) =>
-    page.match(new RegExp(`<tbody [^>]*>(?:(?!</tbody>)[\\s\\S])*?data-id="${id}"`))[0]
+    page.match(new RegExp(`<tbody [^>]*>(?:(?!</tbody>)[\\s\\S])*?data-id="claude:${id}"`))[0]
       .match(/class="dot (s\d)"/)[1];
   return forOne(html, 'aaaa') === forOne(reversed, 'aaaa');
 })(), true);

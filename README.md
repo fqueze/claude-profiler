@@ -1,10 +1,9 @@
 # claude-profiler
 
-Lists Claude Code and Codex sessions together, and turns a Claude Code session
-log into a [Firefox Profiler](https://profiler.firefox.com) profile. The list
-shows where the time, tokens, and money went; a Claude profile shows what the
-model was doing, which tools ran and for how long, and what the sub-agents were
-up to.
+Lists Claude Code and Codex sessions together, and turns either session log
+into a [Firefox Profiler](https://profiler.firefox.com) profile. The list shows
+where the time and money went; profiles show what the model was doing, which
+tools ran and for how long, and what the sub-agents were up to.
 
 Claude Code writes sessions under `~/.claude/projects/`; Codex writes them under
 `~/.codex/sessions/`. Both hold timestamps and usage data, but reading JSONL by
@@ -37,9 +36,9 @@ claude-profiler
 ```
 
 Each row is a session — what it was about, where it ran, when it started, how
-long it actually worked, and its measured usage. Claude rows report calculated
-dollar cost and have a **Profiler** button. For a signed-in Enterprise account,
-Codex rows report backend-estimated dollars; Codex profiles are not built yet.
+long it actually worked, and its measured usage. Every row has a **Profiler**
+button. Claude rows report calculated dollar cost; for a signed-in Enterprise
+account, Codex rows report backend-estimated dollars.
 Sort by any column to find the session worth looking at: the expensive one, the
 long one, or the one with sub-agents.
 
@@ -83,8 +82,8 @@ the JSON session summary, but are omitted from the table to keep it compact.
 
 Clicking a column header sorts by it, so "which session cost the most" and
 "which one ran the most sub-agents" are one click each. The checkbox at the top
-switches the buttons to building [`--size`](#profiling-what-filled-the-context-window)
-profiles instead of timelines.
+switches Claude buttons to building [`--size`](#profiling-what-filled-the-context-window)
+profiles instead of timelines. Codex buttons always build activity timelines.
 
 Profiles are built when a button is clicked rather than up front — a large
 session takes a few seconds — and the server stays up until it is interrupted,
@@ -262,7 +261,7 @@ would drop the embedded text.
 The `--size` document covers only what was resident in the profiled window; the
 timeline's covers the whole track.
 
-## What the profile contains
+## What the Claude profile contains
 
 One process track per agent: the main conversation first, then one per
 sub-agent, ordered by when they started. Sub-agent transcripts are picked up
@@ -301,6 +300,16 @@ Costs are computed from the token counts in the log and the price table in
 `index.js`, which needs updating when prices change. They will not match `/cost`
 exactly; see [Known Limitations](JSONL_FORMAT.md#known-limitations).
 
+### Codex profiles
+
+A Codex profile has one track for the root thread and one for every spawned
+agent. It includes logged turn spans, user and agent messages, reasoning,
+commands, MCP calls, file changes and other tool activity. Each track ends with
+a token-usage marker; the root usage marker also carries the backend's aggregate
+credit and dollar estimates when they are available. The picker keeps those
+extra figures inside the profile rather than adding columns to the compact
+session table.
+
 ## Use as a library
 
 ```js
@@ -336,8 +345,10 @@ to add a profiler button to each session row.
 ## Files
 
 - `index.js` — the CLI, the session list server and the timeline profile builder.
-- `session-index.js` — finds and summarizes the sessions, and renders the list
-  page.
+- `claude-backend.js` / `codex-backend.js` — find and summarize each provider's
+  sessions.
+- `codex-profile.js` — builds Codex activity timelines.
+- `session-index.js` — renders the shared session-list page.
 - `remote.js` — driving another machine's `claude-profiler` over ssh: probing
   for it, offering to install it, and fetching its listings and profiles.
 - `context-size.js` — context window reconstruction, calibration and the size

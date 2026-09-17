@@ -207,7 +207,7 @@ function summarizeSession(file, titles = new Map()) {
     usage,
     credits: null,
     cost: null,
-    profileAvailable: false,
+    profileAvailable: true,
     parentId,
     internal: meta.thread_source === 'guardian_review',
     billingThreadIds: [id]
@@ -252,6 +252,39 @@ function listSessions({ root = codexDir() } = {}) {
   }
 
   return roots.sort((a, b) => (b.started || '').localeCompare(a.started || ''));
+}
+
+// Read one visible thread and every sub-agent descended from it. Profiles need
+// the individual rollouts rather than the aggregate used by the picker.
+function sessionTree(id, { root = codexDir() } = {}) {
+  const titles = sessionTitles(root);
+  const sessions = findSessionFiles(root).map(file => summarizeSession(file, titles));
+  const byId = new Map(sessions.map(session => [session.id, session]));
+  const selected = byId.get(id);
+  if (!selected) return null;
+
+  let rootSession = selected;
+  const seen = new Set();
+  while (rootSession.parentId && !seen.has(rootSession.id)) {
+    seen.add(rootSession.id);
+    rootSession = byId.get(rootSession.parentId);
+    if (!rootSession) return null;
+  }
+
+  const belongsToRoot = (session) => {
+    let current = session;
+    const chain = new Set();
+    while (current?.parentId && !chain.has(current.id)) {
+      chain.add(current.id);
+      current = byId.get(current.parentId);
+    }
+    return current?.id === rootSession.id;
+  };
+
+  return sessions.filter(belongsToRoot).map(session => ({
+    session,
+    entries: readJsonlFile(session.file)
+  }));
 }
 
 function billingAuth(root) {
@@ -343,5 +376,6 @@ module.exports = {
   listSessionsWithUsage,
   addBillingEstimates,
   summarizeSession,
-  sessionTitles
+  sessionTitles,
+  sessionTree
 };

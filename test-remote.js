@@ -88,8 +88,9 @@ check('a listed session carries what the table needs',
 // otherwise re-profiling the session being worked in serves the profile from
 // before it was worked in.
 if (listed.sessions.length > 0) {
-  const id = listed.sessions.find(session => session.profileAvailable !== false)?.id;
-  if (id) {
+  const session = listed.sessions.find(session => session.profileAvailable !== false);
+  if (session) {
+    const id = `${session.provider || 'claude'}:${session.id}`;
     const first = JSON.parse(json(['--json', 'stamp', id]));
     check('stamp answers with a number', typeof first.stamp, 'number');
     check('stamp is the same for an unchanged session',

@@ -1957,7 +1957,12 @@ async function runJsonMode(command, id, options) {
       throw new Error('--json stamp needs a session id');
     }
 
-    const file = sessionFileById(id);
+    const { provider, sessionId } = parseSessionKey(id);
+    if (provider === 'codex') {
+      process.stdout.write(JSON.stringify({ stamp: codexSessionStamp(sessionId) }));
+      return;
+    }
+    const file = sessionFileById(sessionId);
     process.stdout.write(JSON.stringify({
       stamp: file ? fs.statSync(file).mtimeMs : null
     }));
@@ -1969,7 +1974,12 @@ async function runJsonMode(command, id, options) {
       throw new Error('--json profile needs a session id');
     }
 
-    const file = sessionFileById(id);
+    const { provider, sessionId } = parseSessionKey(id);
+    if (provider === 'codex') {
+      process.stdout.write(await buildCodexProfile(sessionId));
+      return;
+    }
+    const file = sessionFileById(sessionId);
     if (!file) {
       throw new Error(`Unknown session ${id}`);
     }
@@ -1990,6 +2000,39 @@ function sessionFileById(id) {
   return findSessionFiles().find(
     (entry) => path.basename(entry.file, '.jsonl') === id
   )?.file || null;
+}
+
+function parseSessionKey(key) {
+  if (key.startsWith('codex:')) return { provider: 'codex', sessionId: key.slice(6) };
+  if (key.startsWith('claude:')) return { provider: 'claude', sessionId: key.slice(7) };
+  // Protocol 1/2 callers sent bare ids, all of which referred to Claude.
+  return { provider: 'claude', sessionId: key };
+}
+
+function codexSessionStamp(id) {
+  const { findSessionFiles, listSessions } = require('./codex-backend.js');
+  const session = listSessions().find(candidate => candidate.id === id);
+  if (!session) return null;
+  const ids = new Set(session.billingThreadIds);
+  const times = findSessionFiles().filter(file =>
+    [...ids].some(threadId => path.basename(file, '.jsonl').endsWith(threadId))
+  ).map(file => fs.statSync(file).mtimeMs);
+  return times.length ? Math.max(...times) : null;
+}
+
+async function buildCodexProfile(id) {
+  const { sessionTree, addBillingEstimates } = require('./codex-backend.js');
+  const tree = sessionTree(id);
+  if (!tree) throw new Error(`Unknown Codex session ${id}`);
+
+  // Cost is an aggregate across this root and all spawned agents, matching the
+  // picker. The profile keeps it as marker metadata rather than adding another
+  // always-visible table column.
+  const root = tree.find(track => !track.session.parentId)?.session || tree[0].session;
+  const billing = { ...root, billingThreadIds: tree.map(track => track.session.id) };
+  await addBillingEstimates([billing]);
+  const { createCodexProfile } = require('./codex-profile.js');
+  return Buffer.from(JSON.stringify(createCodexProfile(tree, billing)), 'utf8');
 }
 
 // The server behind the session picker. Unlike startServer, which serves one
@@ -2121,11 +2164,18 @@ function localSource() {
       .sort((a, b) => (b.started || '').localeCompare(a.started || '')),
 
     stamp: async (id) => {
-      const file = sessionFileById(id);
+      const { provider, sessionId } = parseSessionKey(id);
+      if (provider === 'codex') return codexSessionStamp(sessionId);
+      const file = sessionFileById(sessionId);
       return file ? fs.statSync(file).mtimeMs : null;
     },
 
-    profile: async (id, wantsSize, at) => buildProfile(sessionFileById(id), wantsSize, at)
+    profile: async (id, wantsSize, at) => {
+      const { provider, sessionId } = parseSessionKey(id);
+      return provider === 'codex'
+        ? buildCodexProfile(sessionId)
+        : buildProfile(sessionFileById(sessionId), wantsSize, at);
+    }
   };
 }
 
@@ -2146,7 +2196,9 @@ function remoteSource(host) {
 
     sessions: async () => {
       const sessions = await remote.listSessions(host);
-      lastSeen = new Map(sessions.map((session) => [session.id, session.ended]));
+      lastSeen = new Map(sessions.map((session) => [
+        `${session.provider || 'claude'}:${session.id}`, session.ended
+      ]));
       return sessions;
     },
 

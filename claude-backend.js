@@ -154,6 +154,7 @@ function summarizeSession({ project, file }, deps) {
     subagents: agents.count,
     cost: totalCost(messages),
     tokens: null,
+    credits: null,
     profileAvailable: true
   };
 }

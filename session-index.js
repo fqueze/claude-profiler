@@ -45,6 +45,16 @@ function formatTokens(tokens) {
   return Math.round(tokens).toLocaleString('en-US');
 }
 
+function formatCredits(credits) {
+  if (!Number.isFinite(credits)) return '—';
+  if (credits !== 0 && Math.abs(credits) < 0.01) {
+    return credits.toFixed(6).replace(/0+$/, '');
+  }
+  return credits.toLocaleString('en-US', {
+    minimumFractionDigits: 2, maximumFractionDigits: 2
+  });
+}
+
 function usageTitle(session) {
   if (!session.usage) return '';
   const uncached = Math.max(0,
@@ -113,6 +123,7 @@ function sessionRow(session, maxCost) {
     `<td class="num">${session.subagents || '—'}</td>`,
     `<td class="num">${formatBytes(session.bytes)}</td>`,
     `<td class="num tokens" title="${escapeHtml(usageTitle(session))}">${formatTokens(session.tokens)}</td>`,
+    `<td class="num credits">${formatCredits(session.credits)}</td>`,
     `<td class="num cost">${formatCost(session.cost)}</td>`,
     `<td class="action">
        ${session.profileAvailable === false
@@ -131,6 +142,7 @@ function sessionRow(session, maxCost) {
     session.subagents,
     session.bytes,
     session.tokens ?? '',
+    session.credits ?? '',
     session.cost ?? '',
     0
   ];
@@ -171,7 +183,8 @@ const COLUMNS = [
   { label: 'Sub-agents', className: 'num' },
   { label: 'Size', className: 'num' },
   { label: 'Codex tokens', className: 'num tokens' },
-  { label: 'Claude cost', className: 'num cost' },
+  { label: 'Codex credits', className: 'num credits' },
+  { label: 'Est. cost', className: 'num cost' },
   { label: '', className: 'action', unsortable: true }
 ];
 
@@ -184,7 +197,11 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 
   assignProjectColors(sessions);
 
-  const totalCost = sessions.reduce((sum, session) => sum + session.cost, 0);
+  const claudeCost = sessions.filter(session => session.provider !== 'codex')
+    .reduce((sum, session) => sum + (session.cost || 0), 0);
+  const codexCost = sessions.filter(session => session.provider === 'codex')
+    .reduce((sum, session) => sum + (session.cost || 0), 0);
+  const totalCredits = sessions.reduce((sum, session) => sum + (session.credits || 0), 0);
   const totalTokens = sessions.reduce((sum, session) => sum + (session.tokens || 0), 0);
   const totalBytes = sessions.reduce((sum, session) => sum + session.bytes, 0);
   const maxCost = sessions.reduce((max, session) => Math.max(max, session.cost), 0);
@@ -331,7 +348,9 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 <div class="summary">
   <strong>${sessions.length}</strong> session${sessions.length === 1 ? '' : 's'} ·
   <strong>${formatBytes(totalBytes)}</strong> ·
-  <strong class="total">${formatCost(totalCost)}</strong> Claude total ·
+  <strong class="total">${formatCost(claudeCost)}</strong> Claude ·
+  <strong>${formatCredits(totalCredits)}</strong> Codex credits ·
+  <strong class="total">${formatCost(codexCost)}</strong> Codex ·
   <strong>${formatTokens(totalTokens)}</strong> Codex tokens
 </div>
 
@@ -452,6 +471,7 @@ module.exports = {
   formatBytes,
   formatCost,
   formatTokens,
+  formatCredits,
   formatDuration,
   projectLabel
 };

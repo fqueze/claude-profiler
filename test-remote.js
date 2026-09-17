@@ -60,6 +60,7 @@ function json(args) {
   return execFileSync(NODE, [path.join(__dirname, 'index.js'), ...args], {
     encoding: 'utf-8',
     maxBuffer: 256 * 1024 * 1024,
+    env: { ...process.env, CLAUDE_PROFILER_OFFLINE: '1' },
     // stderr is where progress goes, and it is not part of what is parsed.
     stdio: ['ignore', 'pipe', 'ignore']
   });

@@ -3,7 +3,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  findSessionFiles, listSessions, summarizeSession, sessionTitles
+  findSessionFiles, listSessions, summarizeSession, sessionTitles,
+  addBillingEstimates
 } = require('./codex-backend.js');
 
 let failures = 0;
@@ -73,6 +74,9 @@ fs.writeFileSync(path.join(root, 'session_index.jsonl'), [
   JSON.stringify({ id: 'root', thread_name: 'Indexed title' }),
   '{being-written'
 ].join('\n'));
+fs.writeFileSync(path.join(root, 'auth.json'), JSON.stringify({ tokens: {
+  access_token: 'test-access-token', account_id: 'test-account'
+} }));
 
 check('finds nested Codex rollouts', findSessionFiles(root).length, 2);
 check('reads titles despite an incomplete final index line',
@@ -100,6 +104,39 @@ check('subagent tokens and bytes are included',
   [120, 1, true]);
 check('the session index title wins', sessions[0].title, 'Indexed title');
 
-fs.rmSync(root, { recursive: true, force: true });
-console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
-process.exit(failures === 0 ? 0 : 1);
+const billingCheck = (async () => {
+  let requested;
+  await addBillingEstimates(sessions, { root, fetchImpl: async (url, options) => {
+    requested = { url, options };
+    return {
+      ok: true,
+      json: async () => ({ threads: [
+        { thread_id: 'root', estimated_usage_credits_micros: 46000000,
+          estimated_usage_usd_micros: 1820000 },
+        { thread_id: 'child', estimated_usage_credits_micros: 2000000,
+          estimated_usage_usd_micros: 180000 }
+      ] })
+    };
+  } });
+
+  check('queries the same authenticated thread-usage API as Codex', [
+    requested.url,
+    requested.options.headers.Authorization,
+    requested.options.headers['ChatGPT-Account-Id'],
+    JSON.parse(requested.options.body).thread_ids.sort()
+  ], [
+    'https://chatgpt.com/backend-api/wham/usage/thread_usage/query',
+    'Bearer test-access-token', 'test-account', ['child', 'root']
+  ]);
+  check('adds root and subagent billing estimates',
+    [sessions[0].credits, sessions[0].cost], [48, 2]);
+
+  fs.rmSync(root, { recursive: true, force: true });
+  console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
+  process.exit(failures === 0 ? 0 : 1);
+})();
+
+billingCheck.catch(error => {
+  console.error(error);
+  process.exit(1);
+});

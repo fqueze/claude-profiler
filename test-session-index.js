@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const {
   findSessionFiles, listSessions, renderPage, formatBytes, formatCost,
-  formatDuration, formatTokens, projectLabel
+  formatDuration, formatTokens, formatCredits, projectLabel
 } = require('./session-index.js');
 
 let failures = 0;
@@ -136,6 +136,10 @@ check('formats cost, and says nothing for a free session',
 check('formats exact Codex token counts',
   [formatTokens(0), formatTokens(1234567)], ['—', '1,234,567']);
 
+check('formats backend credit estimates',
+  [formatCredits(null), formatCredits(12.5), formatCredits(0.000004)],
+  ['—', '12.50', '0.000004']);
+
 check('formats a duration in hours and minutes', formatDuration(3900000), '1h 5m');
 
 check('turns a project directory name back into a path',
@@ -149,13 +153,14 @@ const html = renderPage(sessions);
 // page's `dataset['sort' + column]` found nothing and no column ever sorted.
 const sortAttributes = [...html.matchAll(/data-sort(\d+)=/g)].map(m => m[1]);
 check('rows carry the sort keys the script reads',
-  [...new Set(sortAttributes)].sort(), ['0', '1', '2', '3', '4', '5', '6', '7', '8']);
+  [...new Set(sortAttributes)].sort(),
+  ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']);
 
 check('the script reads the attribute the rows actually carry',
   html.includes("getAttribute('data-sort' + column)"), true);
 
 // Sorting has to be on the numbers: "9 MB" sorts above "10 MB" as text.
-const costKeys = [...html.matchAll(/data-sort7="([^"]*)"/g)].map(m => m[1]);
+const costKeys = [...html.matchAll(/data-sort8="([^"]*)"/g)].map(m => m[1]);
 check('the cost sort key is the raw number, not the formatted figure',
   costKeys.every(k => k !== '' && !isNaN(k)), true);
 
@@ -181,14 +186,16 @@ check('Claude rows are labeled', html.includes('provider claude">Claude'), true)
 
 check('a Codex row is labeled, reports tokens, and offers no Claude profile', (() => {
   const page = renderPage([{
-    ...sessions[0], provider: 'codex', id: 'codex', tokens: 1234, cost: null,
+    ...sessions[0], provider: 'codex', id: 'codex', tokens: 1234,
+    credits: 12.5, cost: 1.25,
     profileAvailable: false, usage: {
       input_tokens: 1200, cached_input_tokens: 1000, output_tokens: 34,
       reasoning_output_tokens: 12
     }
   }]);
   return page.includes('provider codex">Codex') &&
-    page.includes('>1,234</td>') && !page.includes('data-id="codex"') &&
+    page.includes('>1,234</td>') && page.includes('>12.50</td>') &&
+    page.includes('>$1.25</td>') && !page.includes('data-id="codex"') &&
     page.includes('Cached input: 1,000');
 })(), true);
 
@@ -234,7 +241,7 @@ check('the script reorders the groups', html.includes('table.append(...sorted)')
 check('the path is a full-width row under the figures',
   new RegExp(`<tr class="path">\\s*<td colspan="${
     ['Session','Started','Active','Messages','Sub-agents','Size',
-      'Codex tokens','Claude cost','']
+      'Codex tokens','Codex credits','Est. cost','']
       .length - 3}"`).test(html), true);
 
 check('the path row carries the working directory and branch',

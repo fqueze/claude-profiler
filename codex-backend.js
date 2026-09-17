@@ -7,6 +7,10 @@ const os = require('os');
 const path = require('path');
 
 const ACTIVE_GAP = 60 * 1000;
+const THREAD_USAGE_ENDPOINT =
+  'https://chatgpt.com/backend-api/wham/usage/thread_usage/query';
+const THREAD_USAGE_BATCH_SIZE = 100;
+const THREAD_USAGE_TIMEOUT_MS = 10000;
 
 function codexDir() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -201,10 +205,12 @@ function summarizeSession(file, titles = new Map()) {
     subagents: 0,
     tokens: usage.total_tokens,
     usage,
+    credits: null,
     cost: null,
     profileAvailable: false,
     parentId,
-    internal: meta.thread_source === 'guardian_review'
+    internal: meta.thread_source === 'guardian_review',
+    billingThreadIds: [id]
   };
 }
 
@@ -242,14 +248,100 @@ function listSessions({ root = codexDir() } = {}) {
     root.entries += session.entries;
     addUsage(root.usage, session.usage);
     root.tokens = root.usage.total_tokens;
+    root.billingThreadIds.push(session.id);
   }
 
   return roots.sort((a, b) => (b.started || '').localeCompare(a.started || ''));
 }
 
+function billingAuth(root) {
+  try {
+    const auth = JSON.parse(fs.readFileSync(path.join(root, 'auth.json'), 'utf8'));
+    const accessToken = auth.tokens?.access_token;
+    const accountId = auth.tokens?.account_id;
+    return accessToken && accountId ? { accessToken, accountId } : null;
+  } catch {
+    return null;
+  }
+}
+
+// The same authoritative per-thread estimate that Codex exposes as
+// `thread-credits` and `estimated-thread-cost` in its status line. This is
+// deliberately best-effort: local history remains useful when offline, when
+// auth is stored somewhere other than auth.json, or when an old thread is no
+// longer available to the billing service.
+async function addBillingEstimates(sessions, {
+  root = codexDir(), fetchImpl = globalThis.fetch
+} = {}) {
+  if (process.env.CLAUDE_PROFILER_OFFLINE === '1') return sessions;
+  const auth = billingAuth(root);
+  if (!auth || typeof fetchImpl !== 'function') return sessions;
+
+  const ids = [...new Set(sessions.flatMap(session => session.billingThreadIds))];
+  const estimates = new Map();
+  for (let offset = 0; offset < ids.length; offset += THREAD_USAGE_BATCH_SIZE) {
+    const batch = ids.slice(offset, offset + THREAD_USAGE_BATCH_SIZE);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), THREAD_USAGE_TIMEOUT_MS);
+    try {
+      const response = await fetchImpl(THREAD_USAGE_ENDPOINT, {
+        method: 'POST',
+        redirect: 'error',
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${auth.accessToken}`,
+          'ChatGPT-Account-Id': auth.accountId,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ thread_ids: batch })
+      });
+      if (!response.ok) continue;
+      const body = await response.json();
+      const requested = new Set(batch);
+      const returned = new Set();
+      if (!Array.isArray(body.threads) || body.threads.some(
+        row => !requested.has(row.thread_id) || !returned.add(row.thread_id)
+      )) {
+        continue;
+      }
+      for (const row of body.threads) {
+        if (Number.isSafeInteger(row.estimated_usage_credits_micros)) {
+          estimates.set(row.thread_id, row);
+        }
+      }
+    } catch {
+      // Token counts from disk are the fallback.
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  for (const session of sessions) {
+    const rows = session.billingThreadIds.map(id => estimates.get(id));
+    // Omitted rows mean unavailable, not zero. Do not publish a partial total.
+    if (rows.some(row => !row)) continue;
+
+    const creditsMicros = rows.reduce(
+      (sum, row) => sum + row.estimated_usage_credits_micros, 0);
+    session.credits = creditsMicros / 1000000;
+    if (rows.every(row => Number.isSafeInteger(row.estimated_usage_usd_micros))) {
+      session.cost = rows.reduce(
+        (sum, row) => sum + row.estimated_usage_usd_micros, 0) / 1000000;
+    }
+  }
+  return sessions;
+}
+
+async function listSessionsWithUsage(options = {}) {
+  const sessions = listSessions(options);
+  return addBillingEstimates(sessions, options);
+}
+
 module.exports = {
   findSessionFiles,
   listSessions,
+  listSessionsWithUsage,
+  addBillingEstimates,
   summarizeSession,
   sessionTitles
 };

@@ -382,6 +382,50 @@ async function addBilling(sessions, options = {}) {
     session.credits = creditsMicros / 1000000;
     session.cost = costMicros / 1000000;
 
+    // Prefer the service's own grouping over reconstructing model attribution
+    // from rollouts. Besides model identity, these rows contain the exact
+    // cached and net-new input counts to which the Enterprise credit estimate
+    // was applied.
+    const completeGroups = rows.every(row => Array.isArray(row.groups) && row.groups.length > 0);
+    const groups = rows.flatMap(row => Array.isArray(row.groups) ? row.groups.map(
+      group => ({ ...group, threadCostMicros: row.estimated_usage_usd_micros,
+        threadCreditsMicros: row.estimated_usage_credits_micros })) : []);
+    if (completeGroups && groups.every(group =>
+      Number.isSafeInteger(group.estimated_usage_credits_micros) &&
+      Number.isSafeInteger(group.input_tokens) &&
+      Number.isSafeInteger(group.cached_input_tokens) &&
+      Number.isSafeInteger(group.net_new_input_tokens) &&
+      Number.isSafeInteger(group.output_tokens))) {
+      const billingUsage = emptyUsage();
+      billingUsage.cache_write_input_tokens = null;
+      billingUsage.net_new_input_tokens = 0;
+      const billingModels = {};
+      for (const group of groups) {
+        const model = group.model || 'Unknown model';
+        const usage = billingModels[model] ||= {
+          ...emptyUsage(), cache_write_input_tokens: null,
+          net_new_input_tokens: 0, credits: 0, cost: 0
+        };
+        for (const target of [billingUsage, usage]) {
+          target.input_tokens += group.input_tokens;
+          target.cached_input_tokens += group.cached_input_tokens;
+          target.net_new_input_tokens += group.net_new_input_tokens;
+          target.output_tokens += group.output_tokens;
+          target.total_tokens += Number.isSafeInteger(group.total_tokens)
+            ? group.total_tokens : group.input_tokens + group.output_tokens;
+        }
+        usage.credits += group.estimated_usage_credits_micros / 1000000;
+        // USD is returned per thread while credits are returned per group.
+        // Allocate the thread's Enterprise dollar estimate by its authoritative
+        // group credit shares; those shares already encode model/effort/speed.
+        const share = group.threadCreditsMicros > 0
+          ? group.estimated_usage_credits_micros / group.threadCreditsMicros : 0;
+        usage.cost += group.threadCostMicros * share / 1000000;
+      }
+      session.billingUsage = billingUsage;
+      session.billingModels = billingModels;
+    }
+
     // The endpoint bills each root and sub-agent thread separately. Preserve
     // that attribution for the model breakdown instead of redistributing the
     // combined session bill in proportion to tokens across differently priced

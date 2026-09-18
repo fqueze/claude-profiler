@@ -242,15 +242,28 @@ check('usage totals include overall and provider breakdowns', (() => {
     } } }
   ]);
   return page.includes('aria-label="Usage totals"') &&
-    /usage-total[\s\S]*?>Total<[\s\S]*?\$3\.00[\s\S]*?>2,000<[\s\S]*?>50<[\s\S]*?≈250<[\s\S]*?>1,650<[\s\S]*?>82\.5%</.test(page) &&
+    /usage-total[\s\S]*?>Total<[\s\S]*?\$3\.00[\s\S]*?>—<[\s\S]*?>2,000<[\s\S]*?>50<[\s\S]*?>350<[\s\S]*?input-minus-cache-read estimates">≈250<[\s\S]*?>1,650<[\s\S]*?>82\.5%</.test(page) &&
     page.includes('usage-provider claude') && page.includes('usage-provider codex');
 })(), true);
 
-check('Codex cache writes use a visibly approximate uncached-input fallback', (() => {
+check('Codex retains an estimated cache-write fallback without API groups', (() => {
   const page = renderPage([{ ...sessions[0], provider: 'codex', id: 'codex-cache',
     usage: { input_tokens: 1000, cached_input_tokens: 800,
       cache_write_input_tokens: 0, output_tokens: 30 } }]);
-  return /usage-provider codex[\s\S]*?>Codex<[\s\S]*?\$1\.00[\s\S]*?>1,000<[\s\S]*?>30<[\s\S]*?estimated from Codex input minus cache reads">≈200</.test(page);
+  return /usage-provider codex[\s\S]*?>Codex<[\s\S]*?\$1\.00[\s\S]*?>—<[\s\S]*?>1,000<[\s\S]*?>30<[\s\S]*?>200<[\s\S]*?input-minus-cache-read estimates">≈200<[\s\S]*?>800</.test(page);
+})(), true);
+
+check('Codex totals use Enterprise API credits and breakdowns', (() => {
+  const billingUsage = {
+    input_tokens: 1000, cached_input_tokens: 800, net_new_input_tokens: 200,
+    cache_write_input_tokens: null, output_tokens: 25, total_tokens: 1025
+  };
+  const page = renderPage([{ ...sessions[0], provider: 'codex', id: 'codex-api',
+    cost: 2, credits: 28.5, billingUsage, billingModels: {
+      'gpt-enterprise': { ...billingUsage, cost: 2, credits: 28.5 }
+    } }]);
+  return /usage-provider codex[\s\S]*?>Codex<[\s\S]*?\$2\.00[\s\S]*?28\.5 Enterprise credits">28\.5<[\s\S]*?>1,000<[\s\S]*?>25<[\s\S]*?>200<[\s\S]*?Enterprise API net-new input">200<[\s\S]*?>800</.test(page) &&
+    /usage-model codex[\s\S]*?gpt-enterprise[\s\S]*?28\.5 Enterprise credits">28\.5<[\s\S]*?Enterprise API net-new input">200</.test(page);
 })(), true);
 
 check('the effective rate amortizes cost over all input and output tokens', (() => {
@@ -258,7 +271,7 @@ check('the effective rate amortizes cost over all input and output tokens', (() 
     input_tokens: 400000, output_tokens: 100000,
     cache_creation_input_tokens: 0, cache_read_input_tokens: 500000
   } }]);
-  return page.includes('>Effective $/M</div>') &&
+  return page.includes('>Est. $/M</div>') &&
     page.includes('title="$3.0000 over 1,000,000 total tokens">$3.00/M</div>');
 })(), true);
 

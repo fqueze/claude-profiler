@@ -38,14 +38,15 @@ claude-profiler
 Each row is a session — what it was about, where it ran, when it started, how
 long it actually worked, and its measured usage. Every row has a **Profiler**
 button. Claude rows report calculated dollar cost; for a signed-in Enterprise
-account, Codex rows report backend dollars.
+account, Codex rows report the backend's Enterprise dollar estimate and credit
+consumption.
 Above the session table, an overall usage row and one row per provider report
-cost, input and output tokens, cache writes, cache reads, and the cached share
-of input-side tokens. A collapsible section breaks the same totals down by
-model. Codex currently emits zero for its cache-write counter, so its write
-figures are visibly marked estimates derived from input tokens minus cache
-reads; exact reported values take precedence when available.
-The effective $/M figure divides actual cost by input plus output tokens. It is
+estimated cost, Enterprise credits, input and output tokens, net-new input,
+cache writes, cache reads, and the cached share of input-side tokens. A
+collapsible section breaks the same totals down by model. Codex cache writes
+use the Enterprise API's exact net-new-input count. When that breakdown is
+unavailable, the input-minus-cache-read fallback is visibly marked `≈`.
+The estimated $/M figure divides cost by input plus output tokens. It is
 the blended, cache-amortized price of processing one million tokens, so cache
 reuse lowers it while costly output and model choice remain reflected in it. An
 effective rate always uses the same billed sessions for both dollars and

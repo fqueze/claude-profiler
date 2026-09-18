@@ -6,6 +6,7 @@ const {
   findSessionFiles, listSessions, summarizeSession, sessionTitles,
   addBilling
 } = require('./codex-backend.js');
+const { renderPage } = require('./session-index.js');
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -112,9 +113,19 @@ const billingCheck = (async () => {
       ok: true,
       json: async () => ({ threads: [
         { thread_id: 'root', estimated_usage_credits_micros: 46000000,
-          estimated_usage_usd_micros: 1820000 },
+          estimated_usage_usd_micros: 1820000, groups: [{
+            model: 'gpt-enterprise', reasoning_effort: 'medium', speed: 'standard',
+            estimated_usage_credits_micros: 46000000,
+            net_new_input_tokens: 50, cached_input_tokens: 450,
+            input_tokens: 500, output_tokens: 20, total_tokens: 520
+          }] },
         { thread_id: 'child', estimated_usage_credits_micros: 2000000,
-          estimated_usage_usd_micros: 180000 }
+          estimated_usage_usd_micros: 180000, groups: [{
+            model: 'gpt-enterprise', reasoning_effort: 'low', speed: 'standard',
+            estimated_usage_credits_micros: 2000000,
+            net_new_input_tokens: 5, cached_input_tokens: 45,
+            input_tokens: 50, output_tokens: 5, total_tokens: 55
+          }] }
       ] })
     };
   } });
@@ -130,9 +141,21 @@ const billingCheck = (async () => {
   ]);
   check('adds root and subagent billing totals',
     [sessions[0].credits, sessions[0].cost], [48, 2]);
-  check('attributes each Codex thread cost to its own model',
-    [sessions[0].models['gpt-test'].cost, sessions[0].models['Unknown model'].cost],
-    [1.82, 0.18]);
+  check('uses the Enterprise API token and model breakdown', [
+    sessions[0].billingUsage,
+    sessions[0].billingModels['gpt-enterprise']
+  ], [{
+    input_tokens: 550, cached_input_tokens: 495, cache_write_input_tokens: null,
+    output_tokens: 25, reasoning_output_tokens: 0, total_tokens: 575,
+    net_new_input_tokens: 55
+  }, {
+    input_tokens: 550, cached_input_tokens: 495, cache_write_input_tokens: null,
+    output_tokens: 25, reasoning_output_tokens: 0, total_tokens: 575,
+    net_new_input_tokens: 55, credits: 48, cost: 2
+  }]);
+  check('renders Enterprise net-new input in the cache-write column',
+    /usage-provider codex[\s\S]*?>Codex<[\s\S]*?>550<[\s\S]*?>25<[\s\S]*?>55<[\s\S]*?Enterprise API net-new input">55<[\s\S]*?>495</
+      .test(renderPage(sessions)), true);
 
   const old = [{ ...summary, tokens: 100, billingThreadIds: ['old'], cost: null }];
   await addBilling(old, { root, fetchImpl: async () => ({

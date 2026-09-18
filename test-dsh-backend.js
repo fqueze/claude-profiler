@@ -4,8 +4,8 @@ const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const {
-  findSessionFiles, listSessions, summarizeSession, sessionTree, sessionStamp,
-  projectLabel
+  findSessionFiles, listSessions, listSessionsWithUsage, summarizeSession,
+  sessionTree, sessionStamp, projectLabel
 } = require('./dsh-backend.js');
 const { renderPage } = require('./session-index.js');
 
@@ -146,6 +146,69 @@ check('renders a DSH usage row under the provider totals',
 check('labels the page for all three providers',
   page.includes('Claude, Codex and DSH sessions'), true);
 
-fs.rmSync(root, { recursive: true, force: true });
-console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
-process.exit(failures === 0 ? 0 : 1);
+const billingCheck = (async () => {
+  // The key DSH would use, written where the backend looks for it.
+  fs.writeFileSync(path.join(root, '.credentials.yaml'),
+    'version: 1\nrefs:\n  OPENROUTER_API_KEY: test-key\n');
+  delete process.env.OPENROUTER_API_KEY;
+
+  const requested = [];
+  const fetchImpl = async (url, options) => {
+    requested.push({ url, authorization: options.headers.Authorization });
+    const id = new URL(url).searchParams.get('id');
+    return { ok: true, json: async () => ({ data: {
+      id, model: id === 'gen-abc' ? 'deepseek/test' : 'deepseek/child',
+      total_cost: id === 'gen-abc' ? 0.001 : 0.002
+    } }) };
+  };
+
+  const billed = await listSessionsWithUsage({ root, fetchImpl, useCache: false });
+  const rootSession = billed.find(session => session.id === ROOT_ID);
+  check('queries the OpenRouter generation of every model call',
+    requested.map(request => new URL(request.url).searchParams.get('id')).sort(),
+    ['gen-abc', 'gen-child']);
+  check('authenticates with the DSH OpenRouter key',
+    requested.every(request => request.authorization === 'Bearer test-key'), true);
+  check('sums the exact cost of a root and its sub-agent',
+    rootSession.cost, 0.003);
+  check('attributes the cost of each generation to its model',
+    [rootSession.models['deepseek/test'].cost,
+      rootSession.models['deepseek/child'].cost], [0.001, 0.002]);
+
+  // A generation the API does not know about is unavailable, not free.
+  const partial = await listSessionsWithUsage({ root, useCache: false,
+    fetchImpl: async (url) => {
+      const id = new URL(url).searchParams.get('id');
+      return id === 'gen-child'
+        ? { ok: false, json: async () => ({}) }
+        : { ok: true, json: async () => ({ data: { total_cost: 0.001 } }) };
+    } });
+  check('a session with an unbilled generation reports no cost',
+    partial.every(session => session.cost === null), true);
+
+  const free = await listSessionsWithUsage({ root, useCache: false,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ data: { total_cost: 0 } }) }) });
+  check('a genuinely free generation is a cost of zero',
+    free.find(session => session.id === ROOT_ID).cost, 0);
+
+  process.env.CLAUDE_PROFILER_OFFLINE = '1';
+  const offline = await listSessionsWithUsage({ root, useCache: false,
+    fetchImpl: async () => { throw new Error('offline must not fetch'); } });
+  delete process.env.CLAUDE_PROFILER_OFFLINE;
+  check('offline leaves DSH tokens without a cost',
+    offline.every(session => session.cost === null), true);
+
+  // A session without any model call has nothing to bill.
+  check('a session with no model call stays unpriced',
+    free.find(session => session.id === 'session-33333333-3333-4333-8333-333333333333').cost,
+    null);
+
+  fs.rmSync(root, { recursive: true, force: true });
+  console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);
+  process.exit(failures === 0 ? 0 : 1);
+})();
+
+billingCheck.catch(error => {
+  console.error(error);
+  process.exit(1);
+});

@@ -445,12 +445,162 @@ function sessionStamp(id, { root = dshDir() } = {}) {
   return times.length ? Math.max(...times) : null;
 }
 
+// OpenRouter remembers what every generation cost. DSH records the generation
+// id of each model call, so this is exact billing rather than a reconstructed
+// estimate. The generation metadata is immutable once written, which is what
+// makes a process-lifetime cache safe.
+const OPENROUTER_GENERATION_ENDPOINT = 'https://openrouter.ai/api/v1/generation';
+const OPENROUTER_TIMEOUT_MS = 10000;
+const OPENROUTER_CONCURRENCY = 8;
+const generationCosts = new Map();
+
+// The key DSH uses for OpenRouter: the environment first, then the reference
+// the credentials service stores in ~/.dsh/.credentials.yaml.
+function openRouterKey(root = dshDir()) {
+  if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
+
+  try {
+    const yaml = fs.readFileSync(path.join(root, '.credentials.yaml'), 'utf8');
+    return yaml.match(/^\s*OPENROUTER_API_KEY:\s*["']?([^"'\s]+)["']?\s*$/m)?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchGenerationCost(id, { key, fetchImpl }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(
+      `${OPENROUTER_GENERATION_ENDPOINT}?id=${encodeURIComponent(id)}`,
+      {
+        redirect: 'error',
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${key}` }
+      });
+    if (!response.ok) return null;
+
+    const data = (await response.json())?.data;
+    return Number.isFinite(data?.total_cost)
+      ? { cost: data.total_cost, model: data.model || null }
+      : null;
+  } catch {
+    // A generation can be too new to be indexed yet, or the network can be
+    // down; either way this call stays unbilled rather than counted as free.
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Run `load` over every item with at most `limit` requests in flight, keeping
+// the results in the order the items were given.
+async function mapLimit(items, limit, load) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await load(items[index], index);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// Cost per OpenRouter generation id, for the ids that resolve. This is
+// deliberately best-effort: local token history remains useful offline, when
+// signed out, and for a provider that is not OpenRouter at all.
+async function fetchBilling(ids, {
+  root = dshDir(), fetchImpl = globalThis.fetch, useCache = true
+} = {}) {
+  const billing = new Map();
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return billing;
+  if (process.env.CLAUDE_PROFILER_OFFLINE === '1') return billing;
+  if (typeof fetchImpl !== 'function') return billing;
+
+  const pending = [];
+  for (const id of unique) {
+    const cached = useCache && generationCosts.get(id);
+    if (cached) billing.set(id, cached);
+    else pending.push(id);
+  }
+
+  const key = pending.length > 0 ? openRouterKey(root) : null;
+  if (!key) return billing;
+
+  const rows = await mapLimit(pending, OPENROUTER_CONCURRENCY,
+    id => fetchGenerationCost(id, { key, fetchImpl }));
+  rows.forEach((row, index) => {
+    if (!row) return;
+    if (useCache) generationCosts.set(pending[index], row);
+    billing.set(pending[index], row);
+  });
+  return billing;
+}
+
+// Charge each session the exact OpenRouter cost of every generation it made.
+// A session only reports a cost when every one of its model calls resolved:
+// publishing a partial total would understate the expensive sessions, which are
+// exactly the ones worth looking at.
+async function addBilling(sessions, options = {}) {
+  const calls = sessions.flatMap(session => session.billingCalls || []);
+  const billing = await fetchBilling(calls.map(call => call.responseId), options);
+
+  for (const session of sessions) {
+    const sessionCalls = session.billingCalls || [];
+    if (sessionCalls.length === 0) continue;
+
+    // One model call can be replayed into more than one record; bill the
+    // generation once and attribute it to the model that made it.
+    const modelByGeneration = new Map();
+    const complete = sessionCalls.every(call => {
+      if (!call.responseId) return false;
+      if (!modelByGeneration.has(call.responseId)) {
+        modelByGeneration.set(call.responseId, call.model);
+      }
+      return true;
+    });
+    if (!complete) continue;
+
+    let total = 0;
+    let billed = true;
+    const costByModel = new Map();
+    for (const [generation, model] of modelByGeneration) {
+      const row = billing.get(generation);
+      if (!row) {
+        billed = false;
+        break;
+      }
+      total += row.cost;
+      costByModel.set(model, (costByModel.get(model) || 0) + row.cost);
+    }
+    if (!billed) continue;
+
+    session.cost = total;
+    for (const [model, cost] of costByModel) {
+      if (session.models[model]) session.models[model].cost = cost;
+    }
+  }
+  return sessions;
+}
+
+async function listSessionsWithUsage(options = {}) {
+  return addBilling(listSessions(options), options);
+}
+
 module.exports = {
   findSessionFiles,
   listSessions,
+  listSessionsWithUsage,
+  addBilling,
+  fetchBilling,
   summarizeSession,
   sessionTree,
   sessionStamp,
   projectLabel,
+  openRouterKey,
   dshDir
 };

@@ -1926,7 +1926,7 @@ function reportSizeProfile(profile, sizeAt) {
 async function runJsonMode(command, id, options) {
   const { listSessions } = require('./claude-backend.js');
   const { listSessionsWithUsage: listCodexSessions } = require('./codex-backend.js');
-  const { listSessions: listDshSessions } = require('./dsh-backend.js');
+  const { listSessionsWithUsage: listDshSessions } = require('./dsh-backend.js');
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };
@@ -1943,7 +1943,7 @@ async function runJsonMode(command, id, options) {
   if (command === 'list') {
     // `file` is a path on this machine, which means nothing to the caller and
     // would be misleading in its UI; the id is what it addresses sessions by.
-    const sessions = [...listSessions(deps), ...(await listCodexSessions()), ...listDshSessions()]
+    const sessions = [...listSessions(deps), ...(await listCodexSessions()), ...(await listDshSessions())]
       .sort((a, b) => (b.started || '').localeCompare(a.started || ''))
       .map(({ file, billingThreadIds, billingThreads, parentId, internal, billingCalls, ...rest }) => rest);
     process.stdout.write(JSON.stringify({ sessions }));
@@ -2164,24 +2164,25 @@ function startIndexServer(profilerOrigin, options = {}, source = localSource()) 
 function localSource() {
   const { listSessions } = require('./claude-backend.js');
   const { listSessionsWithUsage: listCodexSessions } = require('./codex-backend.js');
-  const { listSessions: listDshSessions, sessionStamp: dshSessionStamp } =
+  const { listSessionsWithUsage: listDshSessions, sessionStamp: dshSessionStamp } =
     require('./dsh-backend.js');
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };
-  // Begin the Codex scan and billing call before the HTTP server is opened.
-  // The browser launch and the local Claude and DSH scans then overlap the
-  // network round trip, while the first page request reuses this exact promise
-  // instead of issuing a second request. Later reloads still read fresh data.
+  // Begin the Codex and DSH scans before the HTTP server is opened. Both reach
+  // the network, so the browser launch and the local Claude scan overlap those
+  // round trips, while the first page request reuses these exact promises
+  // instead of issuing them again. Later reloads still read fresh data.
   const nextCodexSessions = prefetchFirst(listCodexSessions);
+  const nextDshSessions = prefetchFirst(listDshSessions);
 
   return {
     host: null,
     sessions: async () => {
       const codex = nextCodexSessions();
+      const dsh = nextDshSessions();
       const claude = listSessions(deps);
-      const dsh = listDshSessions();
-      return [...claude, ...(await codex), ...dsh]
+      return [...claude, ...(await codex), ...(await dsh)]
         .sort((a, b) => (b.started || '').localeCompare(a.started || ''));
     },
 

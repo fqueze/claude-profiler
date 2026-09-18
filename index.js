@@ -1986,7 +1986,8 @@ async function runJsonMode(command, id, options) {
       return;
     }
     if (provider === 'dsh') {
-      throw new Error('DSH profiles are not available yet');
+      process.stdout.write(await buildDshProfile(sessionId));
+      return;
     }
     const file = sessionFileById(sessionId);
     if (!file) {
@@ -2043,6 +2044,22 @@ async function buildCodexProfile(id) {
   }
   const { createCodexProfile } = require('./codex-profile.js');
   return Buffer.from(JSON.stringify(createCodexProfile(tree, billing)), 'utf8');
+}
+
+// A DSH profile bills per generation rather than per thread, so the tree and
+// its exact OpenRouter costs are enough. The billing map may be partial — a
+// session off OpenRouter, too new, or read while offline — and the profile
+// still draws everything its records contain.
+async function buildDshProfile(id) {
+  const { sessionTree, fetchBilling } = require('./dsh-backend.js');
+  const tree = sessionTree(id);
+  if (!tree) throw new Error(`Unknown DSH session ${id}`);
+
+  const generations = tree.flatMap(track =>
+    (track.session.billingCalls || []).map(call => call.responseId));
+  const billing = await fetchBilling(generations);
+  const { createDshProfile } = require('./dsh-profile.js');
+  return Buffer.from(JSON.stringify(createDshProfile(tree, billing)), 'utf8');
 }
 
 // The server behind the session picker. Unlike startServer, which serves one
@@ -2196,7 +2213,7 @@ function localSource() {
 
     profile: async (id, wantsSize, at) => {
       const { provider, sessionId } = parseSessionKey(id);
-      if (provider === 'dsh') throw new Error('DSH profiles are not available yet');
+      if (provider === 'dsh') return buildDshProfile(sessionId);
       return provider === 'codex'
         ? buildCodexProfile(sessionId)
         : buildProfile(sessionFileById(sessionId), wantsSize, at);

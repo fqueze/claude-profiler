@@ -347,7 +347,7 @@ function summarizeSession(file) {
     models,
     credits: null,
     cost: null,
-    profileAvailable: false,
+    profileAvailable: true,
     parentId: header.parentSession || null,
     billingCalls
   };

@@ -73,6 +73,14 @@ function creditCell(total) {
   return `<div role="cell" title="${exact} Enterprise credits">${formatted}</div>`;
 }
 
+// The providers the picker knows how to label and total. Anything else is a
+// Claude session, which is what protocol 1/2 callers sent a bare id for.
+function providerOf(session) {
+  return session.provider === 'codex' || session.provider === 'dsh'
+    ? session.provider
+    : 'claude';
+}
+
 function normalizedUsage(provider, usage = {}) {
   if (provider === 'codex') {
     const cacheRead = usage.cached_input_tokens || 0;
@@ -91,6 +99,21 @@ function normalizedUsage(provider, usage = {}) {
       cacheWrite: reportedCacheWrite ?? newInput,
       cacheWriteEstimated: reportedCacheWrite === null && !hasApiNewInput,
       cacheWriteFromApi: reportedCacheWrite === null && hasApiNewInput,
+      cacheRead
+    };
+  }
+
+  if (provider === 'dsh') {
+    // DSH reports newly processed input and cache reads as disjoint buckets, so
+    // their sum is the whole input side while newInput is the fresh part.
+    const cacheRead = usage.cacheReadTokens || 0;
+    const cacheWrite = usage.cacheWriteTokens > 0 ? usage.cacheWriteTokens : null;
+    return {
+      input: (usage.inputTokens || 0) + cacheRead,
+      output: usage.outputTokens || 0,
+      newInput: usage.inputTokens || 0,
+      // OpenRouter does not report cache writes; a provider that does is kept.
+      cacheWrite,
       cacheRead
     };
   }
@@ -238,12 +261,13 @@ function usageSummary(sessions) {
   const total = emptyTotals('Total');
   const providers = {
     claude: emptyTotals('Claude', 'claude'),
-    codex: emptyTotals('Codex', 'codex')
+    codex: emptyTotals('Codex', 'codex'),
+    dsh: emptyTotals('DSH', 'dsh')
   };
   const models = new Map();
 
   for (const session of sessions) {
-    const provider = session.provider === 'codex' ? 'codex' : 'claude';
+    const provider = providerOf(session);
     const usage = normalizedUsage(provider, session.billingUsage || session.usage);
     const credits = provider === 'codex' ? session.credits : null;
     addTotals(total, usage, session.cost, credits);
@@ -324,8 +348,8 @@ function costBar(cost, maxCost) {
 }
 
 function sessionRow(session, maxCost) {
-  const provider = session.provider || 'claude';
-  const providerLabel = provider === 'codex' ? 'Codex' : 'Claude';
+  const provider = providerOf(session);
+  const providerLabel = { codex: 'Codex', dsh: 'DSH', claude: 'Claude' }[provider];
   const cells = [
     `<td class="title">
        <span class="dot s${session.colorSlot}"></span><span class="provider ${provider}">${providerLabel}</span>${escapeHtml(session.title)}
@@ -410,7 +434,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 
   return `<!DOCTYPE html>
 <meta charset="utf-8">
-<title>Claude and Codex sessions${host ? ` on ${escapeHtml(host)}` : ''}</title>
+<title>Claude, Codex and DSH sessions${host ? ` on ${escapeHtml(host)}` : ''}</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -544,6 +568,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   }
   .provider.codex { color: light-dark(#086b53, #65d6b5); }
   .provider.claude { color: light-dark(#91451d, #f09a68); }
+  .provider.dsh { color: light-dark(#4a3aa7, #a99cf0); }
   .s0 { background: var(--s0); } .s1 { background: var(--s1); }
   .s2 { background: var(--s2); } .s3 { background: var(--s3); }
   .s4 { background: var(--s4); } .s5 { background: var(--s5); }
@@ -586,7 +611,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   h1 .host { color: var(--accent); }
 </style>
 
-<h1>Claude and Codex sessions${host ? ` on <span class="host">${escapeHtml(host)}</span>` : ''}</h1>
+<h1>Claude, Codex and DSH sessions${host ? ` on <span class="host">${escapeHtml(host)}</span>` : ''}</h1>
 <div class="summary">
   <strong>${sessions.length}</strong> session${sessions.length === 1 ? '' : 's'} ·
   <strong>${formatBytes(totalBytes)}</strong>
@@ -623,7 +648,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 </div>
 
 ${sessions.length === 0
-  ? `<p class="empty">No Claude or Codex sessions found${host ? ` on ${escapeHtml(host)}` : ''}.</p>`
+  ? `<p class="empty">No Claude, Codex or DSH sessions found${host ? ` on ${escapeHtml(host)}` : ''}.</p>`
   : `<div class="scroll"><table>
   <thead><tr>${header}</tr></thead>
   ${sessions.map(session => sessionRow(session, maxCost)).join('')}

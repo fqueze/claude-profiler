@@ -115,13 +115,13 @@ const local = renderPage(sessions, {});
 const remote = renderPage(sessions, { host: 'm4' });
 
 check('the local page does not name a host',
-  /<h1>Claude and Codex sessions<\/h1>/.test(local), true);
+  /<h1>Claude, Codex and DSH sessions<\/h1>/.test(local), true);
 
 check('the remote page names the host in the heading',
-  /<h1>Claude and Codex sessions on <span class="host">m4<\/span><\/h1>/.test(remote), true);
+  /<h1>Claude, Codex and DSH sessions on <span class="host">m4<\/span><\/h1>/.test(remote), true);
 
 check('the remote page names the host in the title',
-  /<title>Claude and Codex sessions on m4<\/title>/.test(remote), true);
+  /<title>Claude, Codex and DSH sessions on m4<\/title>/.test(remote), true);
 
 // A host is a name from the command line, and it is interpolated into HTML.
 const injected = renderPage(sessions, { host: '<script>alert(1)</script>' });

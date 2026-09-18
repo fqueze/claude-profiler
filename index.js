@@ -1926,6 +1926,7 @@ function reportSizeProfile(profile, sizeAt) {
 async function runJsonMode(command, id, options) {
   const { listSessions } = require('./claude-backend.js');
   const { listSessionsWithUsage: listCodexSessions } = require('./codex-backend.js');
+  const { listSessions: listDshSessions } = require('./dsh-backend.js');
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };
@@ -1942,9 +1943,9 @@ async function runJsonMode(command, id, options) {
   if (command === 'list') {
     // `file` is a path on this machine, which means nothing to the caller and
     // would be misleading in its UI; the id is what it addresses sessions by.
-    const sessions = [...listSessions(deps), ...(await listCodexSessions())]
+    const sessions = [...listSessions(deps), ...(await listCodexSessions()), ...listDshSessions()]
       .sort((a, b) => (b.started || '').localeCompare(a.started || ''))
-      .map(({ file, billingThreadIds, billingThreads, parentId, internal, ...rest }) => rest);
+      .map(({ file, billingThreadIds, billingThreads, parentId, internal, billingCalls, ...rest }) => rest);
     process.stdout.write(JSON.stringify({ sessions }));
     return;
   }
@@ -1960,6 +1961,11 @@ async function runJsonMode(command, id, options) {
     const { provider, sessionId } = parseSessionKey(id);
     if (provider === 'codex') {
       process.stdout.write(JSON.stringify({ stamp: codexSessionStamp(sessionId) }));
+      return;
+    }
+    if (provider === 'dsh') {
+      const { sessionStamp } = require('./dsh-backend.js');
+      process.stdout.write(JSON.stringify({ stamp: sessionStamp(sessionId) }));
       return;
     }
     const file = sessionFileById(sessionId);
@@ -1978,6 +1984,9 @@ async function runJsonMode(command, id, options) {
     if (provider === 'codex') {
       process.stdout.write(await buildCodexProfile(sessionId));
       return;
+    }
+    if (provider === 'dsh') {
+      throw new Error('DSH profiles are not available yet');
     }
     const file = sessionFileById(sessionId);
     if (!file) {
@@ -2004,6 +2013,7 @@ function sessionFileById(id) {
 
 function parseSessionKey(key) {
   if (key.startsWith('codex:')) return { provider: 'codex', sessionId: key.slice(6) };
+  if (key.startsWith('dsh:')) return { provider: 'dsh', sessionId: key.slice(4) };
   if (key.startsWith('claude:')) return { provider: 'claude', sessionId: key.slice(7) };
   // Protocol 1/2 callers sent bare ids, all of which referred to Claude.
   return { provider: 'claude', sessionId: key };
@@ -2148,19 +2158,21 @@ function startIndexServer(profilerOrigin, options = {}, source = localSource()) 
   });
 }
 
-// This machine's sessions: read from ~/.claude/projects and profiled in
-// process. The methods are async only because the remote source's are, and the
-// server awaits both through the same code.
+// This machine's sessions: read from ~/.claude/projects, ~/.codex/sessions and
+// ~/.dsh/sessions, and profiled in process. The methods are async only because
+// the remote source's are, and the server awaits both through the same code.
 function localSource() {
   const { listSessions } = require('./claude-backend.js');
   const { listSessionsWithUsage: listCodexSessions } = require('./codex-backend.js');
+  const { listSessions: listDshSessions, sessionStamp: dshSessionStamp } =
+    require('./dsh-backend.js');
   const deps = {
     readJsonlFile, readSubagents, sessionTitle, conversationEntries, totalCost
   };
   // Begin the Codex scan and billing call before the HTTP server is opened.
-  // The browser launch and Claude scan then overlap the network round trip,
-  // while the first page request reuses this exact promise instead of issuing
-  // a second request. Later reloads still read fresh data.
+  // The browser launch and the local Claude and DSH scans then overlap the
+  // network round trip, while the first page request reuses this exact promise
+  // instead of issuing a second request. Later reloads still read fresh data.
   const nextCodexSessions = prefetchFirst(listCodexSessions);
 
   return {
@@ -2168,19 +2180,22 @@ function localSource() {
     sessions: async () => {
       const codex = nextCodexSessions();
       const claude = listSessions(deps);
-      return [...claude, ...(await codex)]
+      const dsh = listDshSessions();
+      return [...claude, ...(await codex), ...dsh]
         .sort((a, b) => (b.started || '').localeCompare(a.started || ''));
     },
 
     stamp: async (id) => {
       const { provider, sessionId } = parseSessionKey(id);
       if (provider === 'codex') return codexSessionStamp(sessionId);
+      if (provider === 'dsh') return dshSessionStamp(sessionId);
       const file = sessionFileById(sessionId);
       return file ? fs.statSync(file).mtimeMs : null;
     },
 
     profile: async (id, wantsSize, at) => {
       const { provider, sessionId } = parseSessionKey(id);
+      if (provider === 'dsh') throw new Error('DSH profiles are not available yet');
       return provider === 'codex'
         ? buildCodexProfile(sessionId)
         : buildProfile(sessionFileById(sessionId), wantsSize, at);

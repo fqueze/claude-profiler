@@ -12,8 +12,9 @@ const { spawn } = require('child_process');
 
 // The remote's `claude-profiler --json ...` speaks this, so a version mismatch
 // is caught as a bad protocol rather than as a confusing parse failure further
-// down. Bump it when the shape of what `--json` emits changes.
-const PROTOCOL = 3;
+// down. Bump it when the shape of what `--json` emits changes. Protocol 4 adds
+// DSH to the listing and to `--json profile`.
+const PROTOCOL = 4;
 
 // Where the remote copy comes from when it is missing and installing it is
 // accepted. The published remote rather than the local checkout: what is

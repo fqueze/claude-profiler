@@ -1,14 +1,16 @@
 # claude-profiler
 
-Lists Claude Code and Codex sessions together, and turns either session log
+Lists Claude Code, Codex and DSH sessions together, and turns any session log
 into a [Firefox Profiler](https://profiler.firefox.com) profile. The list shows
 where the time and money went; profiles show what the model was doing, which
 tools ran and for how long, and what the sub-agents were up to.
 
-Claude Code writes sessions under `~/.claude/projects/`; Codex writes them under
-`~/.codex/sessions/`. Both hold timestamps and usage data, but reading JSONL by
-hand does not make sessions easy to compare. The picker normalizes both formats
-into one start-time-sorted page and labels every row by provider.
+Claude Code writes sessions under `~/.claude/projects/`, Codex under
+`~/.codex/sessions/`, and DSH under `~/.dsh/sessions/` as
+Zstandard-compressed JSONL. All three hold timestamps and usage data, but
+reading them by hand does not make sessions easy to compare. The picker
+normalizes every format into one start-time-sorted page and labels every row by
+provider.
 
 ## Install
 
@@ -39,7 +41,8 @@ Each row is a session — what it was about, where it ran, when it started, how
 long it actually worked, and its measured usage. Every row has a **Profiler**
 button. Claude rows report calculated dollar cost; for a signed-in Enterprise
 account, Codex rows report the backend's Enterprise dollar estimate and credit
-consumption.
+consumption; DSH rows report the exact OpenRouter cost of every generation the
+session made.
 Above the session table, an overall usage row and one row per provider report
 estimated cost, Enterprise credits, input and output tokens, net-new input,
 cache writes, cache reads, and the cached share of input-side tokens. A
@@ -79,11 +82,11 @@ Session list at http://127.0.0.1:64761/
 Press Ctrl+C to stop.
 ```
 
-The page interleaves sessions under `~/.claude/projects/` and
-`~/.codex/sessions/`, newest start first. A row carries its provider, title,
-working directory and branch, start time, active time, message and sub-agent
-counts, size on disk, and dollar cost. Cost is banded so expensive
-sessions stand out.
+The page interleaves sessions under `~/.claude/projects/`,
+`~/.codex/sessions/` and `~/.dsh/sessions/`, newest start first. A row carries
+its provider, title, working directory and branch, start time, active time,
+message and sub-agent counts, size on disk, and dollar cost. Cost is banded so
+expensive sessions stand out.
 
 Codex JSONL does not contain a dollar amount or consumed-credit amount. Its
 `rate_limits.credits` object only records whether credits are enabled. When the
@@ -96,10 +99,21 @@ unavailable billing data as zero. Locally recorded tokens remain available in
 the JSON session summary and are included in the totals above the table, while
 remaining out of each session row to keep the table compact.
 
+DSH records the OpenRouter generation id of every model call, and OpenRouter
+remembers what each generation cost. The picker asks for those costs directly,
+so a DSH row is an exact bill rather than a price reconstructed from tokens,
+and a session's sub-agent generations are included in their root. The key is
+read from `OPENROUTER_API_KEY` or the DSH credentials service. This too is
+best-effort: offline, or for a session run through a provider that is not
+OpenRouter, the row leaves cost blank instead of counting the calls as free.
+Cost is withheld unless every one of a session's generations resolved, so a
+partial total never makes an expensive session look cheap.
+
 Clicking a column header sorts by it, so "which session cost the most" and
 "which one ran the most sub-agents" are one click each. The checkbox at the top
 switches Claude buttons to building [`--size`](#profiling-what-filled-the-context-window)
-profiles instead of timelines. Codex buttons always build activity timelines.
+profiles instead of timelines. Codex and DSH buttons always build activity
+timelines.
 
 Profiles are built when a button is clicked rather than up front — a large
 session takes a few seconds — and the server stays up until it is interrupted,
@@ -337,6 +351,27 @@ the cumulative usage snapshots recorded in the rollout. Token and credit
 details stay inside profile markers rather than adding columns to the compact
 session table.
 
+### DSH profiles
+
+A DSH profile has one track for the root session and one for every sub-agent it
+spawned. DSH records explicit turn, step and tool spans, so tracks carry turn
+markers with their completion status, activity spans with the prompt that
+started them, and one tool interval per call, paired to its result by call id;
+a call still waiting for its result stays visible as pending, and failed tool
+results are red. Model responses get a marker each with model, effort and token
+counts, and the reasoning DSH records is kept as its own searchable marker.
+
+As with Claude and Codex, the context and output-token graphs are sampled at
+every model response, and transcript contributions are source-linked weighted
+samples, so the call tree, flame graph, source view and idle-gap treatment work
+on DSH tracks too.
+
+Cost is exact per generation. `Response Cost ($)` marks the responses
+OpenRouter returned a price for, and `Thread Cost ($)` accumulates them on each
+track. A track with an unbilled generation draws no cost graph, and the
+session-wide `Total Cost ($)` is only added when every track resolved, so the
+profile never presents a partial bill as the whole one.
+
 ## Use as a library
 
 ```js
@@ -372,9 +407,11 @@ to add a profiler button to each session row.
 ## Files
 
 - `index.js` — the CLI, the session list server and the timeline profile builder.
-- `claude-backend.js` / `codex-backend.js` — find and summarize each provider's
-  sessions.
-- `codex-profile.js` — builds Codex activity timelines.
+- `claude-backend.js` / `codex-backend.js` / `dsh-backend.js` — find and
+  summarize each provider's sessions, including Codex's Enterprise billing and
+  DSH's OpenRouter generation costs.
+- `codex-profile.js` / `dsh-profile.js` — build Codex and DSH activity
+  timelines.
 - `session-index.js` — renders the shared session-list page.
 - `remote.js` — driving another machine's `claude-profiler` over ssh: probing
   for it, offering to install it, and fetching its listings and profiles.
@@ -389,5 +426,5 @@ to add a profiler button to each session row.
   usage objects, sub-agent layout, cost formula and known limitations.
 
 `npm test` covers the shell parsing, the output attribution, the window
-reconstruction, the calibration, the transcript line mapping, the session list
-and the remote protocol.
+reconstruction, the calibration, the transcript line mapping, the three
+session backends, the profile builders and the remote protocol.

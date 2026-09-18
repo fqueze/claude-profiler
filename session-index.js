@@ -170,9 +170,50 @@ function effectiveRateCell(total) {
   return `<div role="cell" title="${detail}">${formatted}</div>`;
 }
 
+const USAGE_COLUMNS = [
+  { label: 'Usage' },
+  { label: 'Est. cost', title: 'Claude price calculation or Codex Enterprise API dollar estimate' },
+  { label: 'Credits', title: 'Enterprise credits reported by the Codex usage API' },
+  { label: 'Input tokens' },
+  { label: 'Output tokens' },
+  { label: 'New input', title: 'Input not served from cache; reported directly by the Codex Enterprise API when available' },
+  { label: 'Cache write', title: 'Claude cache creation or Codex Enterprise API net-new input; fallback values marked ≈' },
+  { label: 'Cache read' },
+  { label: 'Cached', title: 'Cache reads as a share of all input-side tokens' },
+  { label: 'Est. $/M', title: 'Estimated cost divided by input plus output tokens, normalized to one million tokens' }
+];
+
+function usageHeader(target) {
+  return `<div class="usage-row usage-head" role="row">
+    ${USAGE_COLUMNS.map((column, index) =>
+      `<div role="columnheader" tabindex="0" data-usage-column="${index}" ` +
+      `data-usage-target="${target}"${column.title ? ` title="${escapeHtml(column.title)}"` : ''}>` +
+      `${escapeHtml(column.label)}</div>`).join('')}
+  </div>`;
+}
+
+function usageSortAttributes(total) {
+  const effectiveRate = total.pricedTokens > 0
+    ? total.cost * 1000000 / total.pricedTokens : '';
+  const keys = [
+    total.label.toLowerCase(),
+    total.costComplete || total.cost > 0 ? total.cost : '',
+    total.creditsAvailable ? total.credits : '',
+    total.input,
+    total.output,
+    total.newInput,
+    total.cacheWriteAvailable ? total.cacheWrite : '',
+    total.cacheRead,
+    total.input > 0 ? total.cacheRead / total.input : '',
+    effectiveRate
+  ];
+  return keys.map((key, index) =>
+    `data-usage-sort${index}="${escapeHtml(key)}"`).join(' ');
+}
+
 function usageRow(total, className = '') {
   const showProvider = total.provider && className.includes('usage-model');
-  return `<div class="usage-row ${className}" role="row">
+  return `<div class="usage-row ${className}" role="row" ${usageSortAttributes(total)}>
     <div class="usage-label" role="rowheader">${escapeHtml(total.label)}${showProvider
       ? ` <span class="provider ${total.provider}">${escapeHtml(total.provider)}</span>` : ''}</div>
     <div role="cell"${total.costComplete ? '' : ' title="Some costs are unavailable"'}>${formatTotalCost(total)}</div>
@@ -428,6 +469,16 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   }
   .usage-row > div:not(:first-child) { text-align: right; }
   .usage-head { color: var(--dim); font-size: .82rem; border-bottom: 1px solid var(--line); }
+  .usage-head [data-usage-column] {
+    position: relative; cursor: pointer; user-select: none; white-space: nowrap;
+  }
+  .usage-head [data-usage-column]:hover,
+  .usage-head [data-usage-column]:focus-visible { color: var(--accent); }
+  .usage-head .asc::after, .usage-head .desc::after {
+    position: absolute; margin-left: .2em; font-size: .85em;
+  }
+  .usage-head .asc::after { content: '▲'; }
+  .usage-head .desc::after { content: '▼'; }
   .usage-total { font-weight: 700; background: var(--hover); }
   .usage-label { font-weight: 600; }
   .usage-label .provider { margin-left: .5rem; margin-right: 0; }
@@ -543,21 +594,13 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 
 <section class="usage-summary" aria-label="Usage totals">
   <div class="usage-grid" role="table">
-    <div class="usage-row usage-head" role="row">
-      <div role="columnheader">Usage</div>
-      <div role="columnheader" title="Claude price calculation or Codex Enterprise API dollar estimate">Est. cost</div>
-      <div role="columnheader" title="Enterprise credits reported by the Codex usage API">Credits</div>
-      <div role="columnheader">Input tokens</div><div role="columnheader">Output tokens</div>
-      <div role="columnheader" title="Input not served from cache; reported directly by the Codex Enterprise API when available">New input</div>
-      <div role="columnheader" title="Claude cache creation or Codex Enterprise API net-new input; fallback values marked ≈">Cache write</div><div role="columnheader">Cache read</div>
-      <div role="columnheader" title="Cache reads as a share of all input-side tokens">Cached</div>
-      <div role="columnheader" title="Estimated cost divided by input plus output tokens, normalized to one million tokens">Est. $/M</div>
-    </div>
+    ${usageHeader('providers')}
     ${usageRow(totals.total, 'usage-total')}
     ${totals.providers.map(provider => usageRow(provider, `usage-provider ${provider.provider}`)).join('')}
     ${totals.models.length ? `<details class="usage-models">
       <summary>By model (${totals.models.length})</summary>
       <div class="usage-model-grid">
+        ${usageHeader('models')}
         ${totals.models.map(model => usageRow(model, `usage-model ${model.provider}`)).join('')}
       </div>
     </details>` : ''}
@@ -594,6 +637,71 @@ ${sessions.length === 0
           dateStyle: 'medium', timeStyle: 'short'
         })
       : '—';
+  }
+
+  // The grand total is a fixed reference point. The top header sorts the two
+  // provider rows beneath it; the repeated header inside <details> sorts model
+  // rows independently, without moving either header or the details element.
+  const usageSortState = {
+    providers: { column: -1, ascending: false },
+    models: { column: -1, ascending: false }
+  };
+
+  function sortUsage(target, column) {
+    const state = usageSortState[target];
+    state.ascending = column === state.column ? !state.ascending : column === 0;
+    state.column = column;
+    const selector = target === 'providers' ? '.usage-provider' : '.usage-model';
+    const rows = [...document.querySelectorAll(selector)].sort((a, b) => {
+      const x = a.getAttribute('data-usage-sort' + column);
+      const y = b.getAttribute('data-usage-sort' + column);
+      // Missing provider-specific values sort last in both directions.
+      if (x === '' && y !== '') return 1;
+      if (y === '' && x !== '') return -1;
+      const numeric = x !== '' && y !== '' && !isNaN(x) && !isNaN(y);
+      let order = numeric ? x - y : String(x).localeCompare(String(y));
+      if (order === 0 && column !== 0) {
+        order = a.getAttribute('data-usage-sort0')
+          .localeCompare(b.getAttribute('data-usage-sort0'));
+      }
+      return state.ascending ? order : -order;
+    });
+
+    if (target === 'models') {
+      document.querySelector('.usage-model-grid').append(...rows);
+    } else {
+      const grid = document.querySelector('.usage-grid');
+      const details = grid.querySelector('.usage-models');
+      if (details) {
+        for (const row of rows) grid.insertBefore(row, details);
+      } else {
+        grid.append(...rows);
+      }
+    }
+
+    for (const header of document.querySelectorAll(
+      '[data-usage-target="' + target + '"][data-usage-column]'
+    )) {
+      const active = +header.dataset.usageColumn === column;
+      header.classList.toggle('asc', active && state.ascending);
+      header.classList.toggle('desc', active && !state.ascending);
+      if (active) {
+        header.setAttribute('aria-sort', state.ascending ? 'ascending' : 'descending');
+      } else {
+        header.removeAttribute('aria-sort');
+      }
+    }
+  }
+
+  for (const header of document.querySelectorAll('[data-usage-column]')) {
+    const activate = () => sortUsage(header.dataset.usageTarget,
+      +header.dataset.usageColumn);
+    header.addEventListener('click', activate);
+    header.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      activate();
+    });
   }
 
   // Each session is a <tbody> of two rows — the figures and the path — so the

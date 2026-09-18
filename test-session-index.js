@@ -313,6 +313,24 @@ check('the per-model usage breakdown is collapsible', (() => {
     page.includes('By model (1)') && page.includes('claude-test');
 })(), true);
 
+check('provider and model headers sort every usage column independently', (() => {
+  const page = renderPage([{ ...sessions[0], model: 'claude-test', cost: 2,
+    usage: { input_tokens: 10, output_tokens: 2 },
+    models: { 'claude-test': { input_tokens: 10, output_tokens: 2 } } }]);
+  const headers = target => [...page.matchAll(new RegExp(
+    `data-usage-column="(\\d+)" data-usage-target="${target}"`, 'g'
+  ))].map(match => +match[1]);
+  const rows = [...page.matchAll(
+    /<div class="usage-row usage-(?:provider|model)[^"]*" role="row" ([^>]+)>/g
+  )].map(match => match[1]);
+  return JSON.stringify(headers('providers')) === JSON.stringify([...Array(10).keys()]) &&
+    JSON.stringify(headers('models')) === JSON.stringify([...Array(10).keys()]) &&
+    rows.every(attributes => [...Array(10).keys()].every(index =>
+      attributes.includes(`data-usage-sort${index}=`))) &&
+    page.includes("target === 'providers' ? '.usage-provider' : '.usage-model'") &&
+    page.includes('grid.insertBefore(row, details)');
+})(), true);
+
 check('model rows use a nested grid instead of making details a subgrid',
   html.includes('.usage-models {\n    display: grid;'), false);
 

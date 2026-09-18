@@ -51,7 +51,9 @@ the blended, cache-amortized price of processing one million tokens, so cache
 reuse lowers it while costly output and model choice remain reflected in it. An
 effective rate always uses the same billed sessions for both dollars and
 tokens; unpriced sessions remain in overall/provider usage totals but are left
-out of the per-model cost comparison.
+out of the per-model cost comparison. Every usage column is sortable; the top
+header reorders providers while keeping Total fixed, and the header inside the
+expanded model section sorts models independently.
 Sort by any column to find the session worth looking at: the expensive one, the
 long one, or the one with sub-agents.
 

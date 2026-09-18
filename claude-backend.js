@@ -92,10 +92,68 @@ function subagentBytes(sessionFile) {
   return { bytes, count };
 }
 
+function emptyUsage() {
+  return {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0
+  };
+}
+
+function addUsage(into, usage) {
+  for (const key of Object.keys(emptyUsage())) into[key] += usage?.[key] || 0;
+}
+
+// Claude can write several streaming snapshots for one request. As with the
+// cost calculation, only the final snapshot belongs in the totals.
+function usageByModel(messages, totalCost) {
+  const calls = new Map();
+  for (const message of messages) {
+    const usage = message.message?.usage;
+    if (!usage) continue;
+    const key = message.requestId || message.uuid;
+    if (key) calls.set(key, message);
+  }
+
+  const models = {};
+  const callsByModel = new Map();
+  for (const message of calls.values()) {
+    const model = message.message.model || 'Unknown model';
+    const usage = models[model] ||= emptyUsage();
+    if (!callsByModel.has(model)) callsByModel.set(model, []);
+    callsByModel.get(model).push(message);
+    const source = message.message.usage;
+    usage.input_tokens += source.input_tokens || 0;
+    usage.cache_creation_input_tokens += source.cache_creation_input_tokens ||
+      (source.cache_creation?.ephemeral_5m_input_tokens || 0) +
+      (source.cache_creation?.ephemeral_1h_input_tokens || 0);
+    usage.cache_read_input_tokens += source.cache_read_input_tokens || 0;
+    usage.output_tokens += source.output_tokens || 0;
+  }
+  for (const [model, modelCalls] of callsByModel) {
+    models[model].cost = totalCost(modelCalls);
+  }
+  return models;
+}
+
+function totalUsage(models) {
+  const usage = emptyUsage();
+  for (const modelUsage of Object.values(models)) addUsage(usage, modelUsage);
+  return usage;
+}
+
+function addModels(into, models) {
+  for (const [model, usage] of Object.entries(models)) {
+    const target = into[model] ||= emptyUsage();
+    addUsage(target, usage);
+    if (usage.cost !== undefined) target.cost = (target.cost || 0) + usage.cost;
+  }
+}
+
 // One row of the table. Everything here comes from a single pass over the
-// session's own entries plus a stat of each sub-agent file: parsing the
-// sub-agent transcripts as well would triple the work for numbers the row
-// already has, since their cost is rolled into `cost` below only when asked.
+// session's own entries plus a stat of each sub-agent file. Sub-agent usage is
+// folded in later alongside its cost, when those transcripts are read.
 function summarizeSession({ project, file }, deps) {
   const { readJsonlFile, sessionTitle, conversationEntries, totalCost } = deps;
 
@@ -133,6 +191,8 @@ function summarizeSession({ project, file }, deps) {
   }
 
   const messages = conversationEntries(entries);
+  const models = usageByModel(messages, totalCost);
+  const usage = totalUsage(models);
 
   return {
     provider: 'claude',
@@ -153,25 +213,31 @@ function summarizeSession({ project, file }, deps) {
     bytes: (stat?.size || 0) + agents.bytes,
     subagents: agents.count,
     cost: totalCost(messages),
-    tokens: null,
+    tokens: Object.values(usage).reduce((sum, value) => sum + value, 0),
+    usage,
+    models,
     credits: null,
     profileAvailable: true
   };
 }
 
-// The sub-agents' own API calls, which is most of a session's cost when it
-// spawned any. Kept separate from summarizeSession because it means reading
-// every sub-agent transcript.
-function subagentCost(sessionFile, deps) {
+// The sub-agents' own API calls. Kept separate from summarizeSession because
+// it means reading every sub-agent transcript.
+function subagentSummary(sessionFile, deps) {
   const { readSubagents, conversationEntries, totalCost } = deps;
 
   try {
-    return readSubagents(sessionFile).reduce(
-      (sum, agent) => sum + totalCost(conversationEntries(agent.entries)),
-      0
-    );
+    const result = { cost: 0, usage: emptyUsage(), models: {} };
+    for (const agent of readSubagents(sessionFile)) {
+      const messages = conversationEntries(agent.entries);
+      const models = usageByModel(messages, totalCost);
+      result.cost += totalCost(messages);
+      addModels(result.models, models);
+      addUsage(result.usage, totalUsage(models));
+    }
+    return result;
   } catch {
-    return 0;
+    return { cost: 0, usage: emptyUsage(), models: {} };
   }
 }
 
@@ -196,7 +262,12 @@ function listSessions(deps, { root, withSubagentCost = true } = {}) {
     }
 
     if (withSubagentCost && session.subagents > 0) {
-      session.cost += subagentCost(session.file, deps);
+      const agents = subagentSummary(session.file, deps);
+      session.cost += agents.cost;
+      addUsage(session.usage, agents.usage);
+      addModels(session.models, agents.models);
+      session.tokens = Object.values(session.usage)
+        .reduce((sum, value) => sum + value, 0);
     }
 
     sessions.push(session);

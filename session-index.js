@@ -40,6 +40,173 @@ function formatCost(cost) {
   return cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`;
 }
 
+function formatTotalCost(total) {
+  if (!total.costComplete && total.cost === 0) return '—';
+  return `$${total.cost.toFixed(2)}`;
+}
+
+function formatTokens(tokens) {
+  const value = Math.round(tokens || 0);
+  if (Math.abs(value) < 10000) return value.toLocaleString('en-US');
+  return new Intl.NumberFormat('en-US', {
+    notation: 'compact', maximumFractionDigits: 1
+  }).format(value);
+}
+
+function tokenCell(tokens, { estimated = false } = {}) {
+  const value = Math.round(tokens || 0);
+  const formatted = formatTokens(value);
+  const exact = value.toLocaleString('en-US');
+  const title = estimated
+    ? `${exact} tokens; estimated from Codex input minus cache reads`
+    : formatted === exact ? '' : `${exact} tokens`;
+  return `<div role="cell"${title ? ` title="${title}"` : ''}>${estimated ? '≈' : ''}${formatted}</div>`;
+}
+
+function normalizedUsage(provider, usage = {}) {
+  if (provider === 'codex') {
+    const cacheRead = usage.cached_input_tokens || 0;
+    const reportedCacheWrite = usage.cache_write_input_tokens || 0;
+    return {
+      // Codex reports cached input as a subset of input_tokens.
+      input: usage.input_tokens || 0,
+      output: usage.output_tokens || 0,
+      // Current Codex rollouts emit zero for every response. In that case the
+      // uncached portion is the best available proxy: it includes tokens that
+      // may not ultimately be retained, so keep it visibly approximate.
+      cacheWrite: reportedCacheWrite || Math.max(0, (usage.input_tokens || 0) - cacheRead),
+      cacheWriteEstimated: reportedCacheWrite === 0,
+      cacheRead
+    };
+  }
+
+  const creation = usage.cache_creation;
+  const cacheWrite = usage.cache_creation_input_tokens ||
+    (creation?.ephemeral_5m_input_tokens || 0) +
+    (creation?.ephemeral_1h_input_tokens || 0);
+  const cacheRead = usage.cache_read_input_tokens || 0;
+  return {
+    // Claude reports these as three disjoint input buckets. Present their sum
+    // as Input, with the cache columns showing how that total breaks down.
+    input: (usage.input_tokens || 0) + cacheWrite + cacheRead,
+    output: usage.output_tokens || 0,
+    cacheWrite,
+    cacheRead
+  };
+}
+
+function emptyTotals(label, provider = null) {
+  return { label, provider, cost: 0, costComplete: true,
+    input: 0, output: 0, cacheWrite: 0, cacheWriteAvailable: false,
+    cacheWriteEstimated: false, cacheRead: 0, pricedTokens: 0, unpricedTokens: 0 };
+}
+
+function addTotals(total, usage, cost = 0) {
+  const tokens = (usage.input || 0) + (usage.output || 0);
+  if (cost === null || cost === undefined) {
+    total.costComplete = false;
+    total.unpricedTokens += tokens;
+  } else {
+    total.cost += cost;
+    total.pricedTokens += tokens;
+  }
+  for (const key of ['input', 'output', 'cacheRead']) {
+    total[key] += usage[key] || 0;
+  }
+  if (usage.cacheWrite !== null && usage.cacheWrite !== undefined) {
+    total.cacheWrite += usage.cacheWrite;
+    total.cacheWriteAvailable = true;
+    total.cacheWriteEstimated ||= usage.cacheWriteEstimated === true;
+  }
+}
+
+function cachedPercent(total) {
+  return total.input > 0 ? `${(100 * total.cacheRead / total.input).toFixed(1)}%` : '—';
+}
+
+function effectiveRateCell(total) {
+  const tokens = total.pricedTokens;
+  if (tokens <= 0) {
+    const reason = total.unpricedTokens > 0 ? 'No billing data for these tokens' : 'No token usage';
+    return `<div role="cell" title="${reason}">—</div>`;
+  }
+
+  const rate = total.cost * 1000000 / tokens;
+  const formatted = rate > 0 && rate < 0.01
+    ? '<$0.01/M'
+    : rate >= 1000
+      ? `$${new Intl.NumberFormat('en-US', {
+        notation: 'compact', maximumFractionDigits: 1
+      }).format(rate)}/M`
+      : `$${rate.toFixed(2)}/M`;
+  const partial = total.unpricedTokens > 0;
+  const detail = partial
+    ? `$${total.cost.toFixed(4)} over ${tokens.toLocaleString('en-US')} priced tokens; ` +
+      `excludes ${total.unpricedTokens.toLocaleString('en-US')} tokens without billing data`
+    : `$${total.cost.toFixed(4)} over ${tokens.toLocaleString('en-US')} total tokens`;
+  return `<div role="cell" title="${detail}">${formatted}</div>`;
+}
+
+function usageRow(total, className = '') {
+  const showProvider = total.provider && className.includes('usage-model');
+  return `<div class="usage-row ${className}" role="row">
+    <div class="usage-label" role="rowheader">${escapeHtml(total.label)}${showProvider
+      ? ` <span class="provider ${total.provider}">${escapeHtml(total.provider)}</span>` : ''}</div>
+    <div role="cell"${total.costComplete ? '' : ' title="Some costs are unavailable"'}>${formatTotalCost(total)}</div>
+    ${tokenCell(total.input)}
+    ${tokenCell(total.output)}
+    ${total.cacheWriteAvailable
+      ? tokenCell(total.cacheWrite, { estimated: total.cacheWriteEstimated })
+      : '<div role="cell" title="Not reported by this provider">—</div>'}
+    ${tokenCell(total.cacheRead)}
+    <div role="cell">${cachedPercent(total)}</div>
+    ${effectiveRateCell(total)}
+  </div>`;
+}
+
+function usageSummary(sessions) {
+  const total = emptyTotals('Total');
+  const providers = {
+    claude: emptyTotals('Claude', 'claude'),
+    codex: emptyTotals('Codex', 'codex')
+  };
+  const models = new Map();
+
+  for (const session of sessions) {
+    const provider = session.provider === 'codex' ? 'codex' : 'claude';
+    const usage = normalizedUsage(provider, session.usage);
+    addTotals(total, usage, session.cost);
+    addTotals(providers[provider], usage, session.cost);
+
+    const entries = Object.entries(session.models || {});
+    const modelEntries = entries.length ? entries : [[session.model || 'Unknown model', session.usage]];
+    const weights = modelEntries.map(([, modelUsage]) => {
+      const normalized = normalizedUsage(provider, modelUsage);
+      return normalized.input + normalized.output;
+    });
+    const weightTotal = weights.reduce((sum, value) => sum + value, 0);
+
+    modelEntries.forEach(([model, modelUsage], index) => {
+      // A model row is a cost comparison. If this session has no billing data,
+      // exclude both its cost and tokens so the row keeps one coherent
+      // denominator. Provider and overall rows above still retain all usage.
+      if (!Number.isFinite(modelUsage?.cost) &&
+          (session.cost === null || session.cost === undefined)) return;
+      const key = `${provider}:${model}`;
+      if (!models.has(key)) models.set(key, emptyTotals(model, provider));
+      const share = weightTotal > 0 ? weights[index] / weightTotal : 1 / modelEntries.length;
+      const modelCost = Number.isFinite(modelUsage?.cost)
+        ? modelUsage.cost
+        : session.cost === null || session.cost === undefined ? null : session.cost * share;
+      addTotals(models.get(key), normalizedUsage(provider, modelUsage), modelCost);
+    });
+  }
+
+  return { total, providers: Object.values(providers), models: [...models.values()]
+    .filter(model => model.input + model.output > 0 || model.cost > 0)
+    .sort((a, b) => b.cost - a.cost || a.label.localeCompare(b.label)) };
+}
+
 function formatDuration(ms) {
   if (!(ms > 0)) return '—';
 
@@ -164,10 +331,7 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 
   assignProjectColors(sessions);
 
-  const claudeCost = sessions.filter(session => session.provider !== 'codex')
-    .reduce((sum, session) => sum + (session.cost || 0), 0);
-  const codexCost = sessions.filter(session => session.provider === 'codex')
-    .reduce((sum, session) => sum + (session.cost || 0), 0);
+  const totals = usageSummary(sessions);
   const totalBytes = sessions.reduce((sum, session) => sum + session.bytes, 0);
   const maxCost = sessions.reduce((max, session) => Math.max(max, session.cost), 0);
 
@@ -215,6 +379,36 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   .summary { color: var(--dim); margin-bottom: 1.5rem; }
   .summary strong { color: var(--fg); font-variant-numeric: tabular-nums; }
   .summary .total { color: var(--accent); }
+  .usage-summary {
+    margin: 1rem 0 1.5rem; overflow-x: auto;
+    border: 1px solid var(--line); border-radius: 6px;
+    --usage-columns: minmax(10rem, 1fr) repeat(7, minmax(5.5rem, auto));
+  }
+  .usage-grid {
+    display: grid;
+    grid-template-columns: var(--usage-columns);
+    min-width: 54rem;
+  }
+  .usage-row {
+    display: grid; grid-template-columns: subgrid; grid-column: 1 / -1;
+    column-gap: 1rem; padding: .42rem .7rem; align-items: baseline;
+    box-sizing: border-box; font-variant-numeric: tabular-nums;
+  }
+  .usage-row > div:not(:first-child) { text-align: right; }
+  .usage-head { color: var(--dim); font-size: .82rem; border-bottom: 1px solid var(--line); }
+  .usage-total { font-weight: 700; background: var(--hover); }
+  .usage-label { font-weight: 600; }
+  .usage-label .provider { margin-left: .5rem; margin-right: 0; }
+  .usage-models {
+    grid-column: 1 / -1; border-top: 1px solid var(--line);
+  }
+  .usage-models summary {
+    cursor: pointer; color: var(--dim); padding: .45rem .7rem; user-select: none;
+  }
+  .usage-models[open] summary { border-bottom: 1px solid var(--line); }
+  .usage-model-grid {
+    display: grid; grid-template-columns: var(--usage-columns);
+  }
   .options {
     margin-bottom: 1rem; display: flex; align-items: center;
     gap: .5rem 1rem; flex-wrap: wrap;
@@ -312,10 +506,28 @@ function renderPage(sessions, { size = false, host = null } = {}) {
 <h1>Claude and Codex sessions${host ? ` on <span class="host">${escapeHtml(host)}</span>` : ''}</h1>
 <div class="summary">
   <strong>${sessions.length}</strong> session${sessions.length === 1 ? '' : 's'} ·
-  <strong>${formatBytes(totalBytes)}</strong> ·
-  <strong class="total">${formatCost(claudeCost)}</strong> Claude ·
-  <strong class="total">${formatCost(codexCost)}</strong> Codex
+  <strong>${formatBytes(totalBytes)}</strong>
 </div>
+
+<section class="usage-summary" aria-label="Usage totals">
+  <div class="usage-grid" role="table">
+    <div class="usage-row usage-head" role="row">
+      <div role="columnheader">Usage</div><div role="columnheader">Cost</div>
+      <div role="columnheader">Input tokens</div><div role="columnheader">Output tokens</div>
+      <div role="columnheader" title="Codex values marked ≈ are estimated from uncached input">Cache write</div><div role="columnheader">Cache read</div>
+      <div role="columnheader" title="Cache reads as a share of all input-side tokens">Cached</div>
+      <div role="columnheader" title="Actual cost divided by input plus output tokens, normalized to one million tokens">Effective $/M</div>
+    </div>
+    ${usageRow(totals.total, 'usage-total')}
+    ${totals.providers.map(provider => usageRow(provider, `usage-provider ${provider.provider}`)).join('')}
+    ${totals.models.length ? `<details class="usage-models">
+      <summary>By model (${totals.models.length})</summary>
+      <div class="usage-model-grid">
+        ${totals.models.map(model => usageRow(model, `usage-model ${model.provider}`)).join('')}
+      </div>
+    </details>` : ''}
+  </div>
+</section>
 
 <div class="options">
   <label>

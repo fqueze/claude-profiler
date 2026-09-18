@@ -130,6 +130,20 @@ const billingCheck = (async () => {
   ]);
   check('adds root and subagent billing totals',
     [sessions[0].credits, sessions[0].cost], [48, 2]);
+  check('attributes each Codex thread cost to its own model',
+    [sessions[0].models['gpt-test'].cost, sessions[0].models['Unknown model'].cost],
+    [1.82, 0.18]);
+
+  const old = [{ ...summary, tokens: 100, billingThreadIds: ['old'], cost: null }];
+  await addBilling(old, { root, fetchImpl: async () => ({
+    ok: true,
+    json: async () => ({ threads: [
+      { thread_id: 'old', estimated_usage_credits_micros: 0,
+        estimated_usage_usd_micros: 0 }
+    ] })
+  }) });
+  check('an all-zero billing placeholder is unavailable rather than free',
+    old[0].cost, null);
 
   fs.rmSync(root, { recursive: true, force: true });
   console.log(failures === 0 ? '\nall passed' : `\n${failures} failed`);

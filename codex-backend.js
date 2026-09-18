@@ -128,6 +128,12 @@ function addUsage(into, usage) {
   for (const key of Object.keys(into)) into[key] += usage?.[key] || 0;
 }
 
+function addModels(into, models) {
+  for (const [model, usage] of Object.entries(models)) {
+    addUsage(into[model] ||= emptyUsage(), usage);
+  }
+}
+
 function summarizeSession(file, titles = new Map()) {
   const stat = statSafe(file);
   const entries = readJsonlFile(file);
@@ -205,12 +211,14 @@ function summarizeSession(file, titles = new Map()) {
     subagents: 0,
     tokens: usage.total_tokens,
     usage,
+    models: { [model || 'Unknown model']: copyUsage(usage) },
     credits: null,
     cost: null,
     profileAvailable: true,
     parentId,
     internal: meta.thread_source === 'guardian_review',
-    billingThreadIds: [id]
+    billingThreadIds: [id],
+    billingThreads: [{ id, model: model || 'Unknown model', tokens: usage.total_tokens }]
   };
 }
 
@@ -247,8 +255,10 @@ function listSessions({ root = codexDir() } = {}) {
     root.bytes += session.bytes;
     root.entries += session.entries;
     addUsage(root.usage, session.usage);
+    addModels(root.models, session.models);
     root.tokens = root.usage.total_tokens;
     root.billingThreadIds.push(session.id);
+    root.billingThreads.push(...session.billingThreads);
   }
 
   return roots.sort((a, b) => (b.started || '').localeCompare(a.started || ''));
@@ -363,9 +373,32 @@ async function addBilling(sessions, options = {}) {
 
     const creditsMicros = rows.reduce(
       (sum, row) => sum + row.estimated_usage_credits_micros, 0);
+    const costMicros = rows.reduce(
+      (sum, row) => sum + row.estimated_usage_usd_micros, 0);
+    // The backend returns all-zero placeholder billing rows for old threads
+    // that still have substantial recorded token usage. Zero there means the
+    // estimate is unavailable, not that those tokens were free.
+    if (session.tokens > 0 && creditsMicros === 0 && costMicros === 0) continue;
     session.credits = creditsMicros / 1000000;
-    session.cost = rows.reduce(
-      (sum, row) => sum + row.estimated_usage_usd_micros, 0) / 1000000;
+    session.cost = costMicros / 1000000;
+
+    // The endpoint bills each root and sub-agent thread separately. Preserve
+    // that attribution for the model breakdown instead of redistributing the
+    // combined session bill in proportion to tokens across differently priced
+    // models.
+    const threadsByModel = new Map();
+    for (const thread of session.billingThreads || []) {
+      if (!threadsByModel.has(thread.model)) threadsByModel.set(thread.model, []);
+      threadsByModel.get(thread.model).push({ ...thread, row: billingById.get(thread.id) });
+    }
+    for (const [model, threads] of threadsByModel) {
+      const complete = threads.every(({ row, tokens }) => row &&
+        !(tokens > 0 && row.estimated_usage_usd_micros === 0 &&
+          row.estimated_usage_credits_micros === 0));
+      if (!complete || !session.models[model]) continue;
+      session.models[model].cost = threads.reduce(
+        (sum, { row }) => sum + row.estimated_usage_usd_micros, 0) / 1000000;
+    }
   }
   return sessions;
 }

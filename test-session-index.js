@@ -28,7 +28,15 @@ function check(name, actual, expected) {
 const deps = {
   readJsonlFile: (file) => fs.readFileSync(file, 'utf-8').trim().split('\n')
     .filter(Boolean).map(line => JSON.parse(line)),
-  readSubagents: () => [],
+  readSubagents: (sessionFile) => {
+    const dir = path.join(path.dirname(sessionFile), path.basename(sessionFile, '.jsonl'),
+      'subagents');
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir).filter(name => name.endsWith('.jsonl')).map(name => ({
+      entries: fs.readFileSync(path.join(dir, name), 'utf8').trim().split('\n')
+        .filter(Boolean).map(line => JSON.parse(line))
+    }));
+  },
   sessionTitle: (entries) => {
     const titled = [...entries].reverse().find(e => e.type === 'ai-title');
     return titled ? titled.aiTitle : 'Main conversation';
@@ -66,10 +74,19 @@ const at = (minutes) =>
 writeSession('-Users-me-buildgit-alpha', 'aaaa', [
   { type: 'user', message: { role: 'user', content: 'hi' },
     timestamp: at(0), cwd: '/Users/me/buildgit/alpha', gitBranch: 'main' },
-  { type: 'assistant', message: { role: 'assistant', content: 'yo' },
-    timestamp: at(1), cwd: '/Users/me/buildgit/alpha', gitBranch: 'main' },
+  { type: 'assistant', requestId: 'request-1', timestamp: at(1), cwd: '/Users/me/buildgit/alpha',
+    gitBranch: 'main', message: { role: 'assistant', content: 'yo', model: 'claude-test',
+      usage: { input_tokens: 10, output_tokens: 2,
+        cache_creation_input_tokens: 3, cache_read_input_tokens: 85 } } },
   { type: 'ai-title', aiTitle: 'Alpha session' }
-], ['{}\n']);
+], [
+  `${JSON.stringify({ type: 'assistant', requestId: 'agent-request-1', message: {
+    role: 'assistant', model: 'claude-test', usage: { input_tokens: 1, output_tokens: 1 }
+  } })}\n`,
+  `${JSON.stringify({ type: 'assistant', requestId: 'agent-request-2', message: {
+    role: 'assistant', model: 'claude-test', usage: { input_tokens: 2, output_tokens: 1 }
+  } })}\n`
+]);
 
 // A newer session, in a different project, with a long idle gap in the middle.
 writeSession('-Users-me-buildgit-beta', 'bbbb', [
@@ -114,7 +131,16 @@ check('reports the working directory and branch from the entries',
 check('counts the conversation messages, not every entry',
   [alpha.messages, alpha.entries], [2, 3]);
 
-check('counts the sub-agent transcripts', alpha.subagents, 1);
+check('counts the sub-agent transcripts', alpha.subagents, 2);
+
+check('collects Claude token usage by model',
+  [alpha.usage, alpha.models], [{
+    input_tokens: 13, cache_creation_input_tokens: 3,
+    cache_read_input_tokens: 85, output_tokens: 4
+  }, { 'claude-test': {
+    input_tokens: 13, cache_creation_input_tokens: 3,
+    cache_read_input_tokens: 85, output_tokens: 4, cost: 1.5
+  } }]);
 
 // Wall clock would call this a two hour session; only the first minute of it
 // was the session doing anything.
@@ -132,6 +158,14 @@ check('formats bytes', [formatBytes(512), formatBytes(2048), formatBytes(5 << 20
 
 check('formats cost, and says nothing for a free session',
   [formatCost(0), formatCost(0.004), formatCost(12.5)], ['—', '<$0.01', '$12.50']);
+
+check('large usage totals are compact but retain their exact value', (() => {
+  const page = renderPage([{ ...sessions[0], usage: {
+    input_tokens: 1234567, output_tokens: 0,
+    cache_creation_input_tokens: 0, cache_read_input_tokens: 0
+  } }]);
+  return page.includes('title="1,234,567 tokens">1.2M</div>');
+})(), true);
 
 check('formats a duration in hours and minutes', formatDuration(3900000), '1h 5m');
 
@@ -189,6 +223,85 @@ check('a Codex row is labeled, reports cost, and offers its profiler', (() => {
     page.includes('>$1.25</td>') && page.includes('data-id="codex:codex"') &&
     !page.includes('Codex tokens') && !page.includes('Codex credits');
 })(), true);
+
+check('usage totals include overall and provider breakdowns', (() => {
+  const page = renderPage([
+    { ...sessions[0], cost: 2, usage: {
+      input_tokens: 100, output_tokens: 20,
+      cache_creation_input_tokens: 50, cache_read_input_tokens: 850
+    }, models: { 'claude-test': {
+      input_tokens: 100, output_tokens: 20,
+      cache_creation_input_tokens: 50, cache_read_input_tokens: 850
+    } } },
+    { ...sessions[1], provider: 'codex', id: 'codex-usage', cost: 1, usage: {
+      input_tokens: 1000, cached_input_tokens: 800,
+      cache_write_input_tokens: 0, output_tokens: 30
+    }, models: { 'gpt-test': {
+      input_tokens: 1000, cached_input_tokens: 800,
+      cache_write_input_tokens: 0, output_tokens: 30
+    } } }
+  ]);
+  return page.includes('aria-label="Usage totals"') &&
+    /usage-total[\s\S]*?>Total<[\s\S]*?\$3\.00[\s\S]*?>2,000<[\s\S]*?>50<[\s\S]*?≈250<[\s\S]*?>1,650<[\s\S]*?>82\.5%</.test(page) &&
+    page.includes('usage-provider claude') && page.includes('usage-provider codex');
+})(), true);
+
+check('Codex cache writes use a visibly approximate uncached-input fallback', (() => {
+  const page = renderPage([{ ...sessions[0], provider: 'codex', id: 'codex-cache',
+    usage: { input_tokens: 1000, cached_input_tokens: 800,
+      cache_write_input_tokens: 0, output_tokens: 30 } }]);
+  return /usage-provider codex[\s\S]*?>Codex<[\s\S]*?\$1\.00[\s\S]*?>1,000<[\s\S]*?>30<[\s\S]*?estimated from Codex input minus cache reads">≈200</.test(page);
+})(), true);
+
+check('the effective rate amortizes cost over all input and output tokens', (() => {
+  const page = renderPage([{ ...sessions[0], cost: 3, usage: {
+    input_tokens: 400000, output_tokens: 100000,
+    cache_creation_input_tokens: 0, cache_read_input_tokens: 500000
+  } }]);
+  return page.includes('>Effective $/M</div>') &&
+    page.includes('title="$3.0000 over 1,000,000 total tokens">$3.00/M</div>');
+})(), true);
+
+check('the effective rate is unavailable when none of the tokens have billing data', (() => {
+  const page = renderPage([{ ...sessions[0], provider: 'codex', cost: null,
+    usage: { input_tokens: 1000, cached_input_tokens: 800, output_tokens: 30 } }]);
+  const row = page.match(/usage-total[\s\S]*?<\/div>\s*<div class="usage-row usage-provider/)[0];
+  return row.includes('title="No billing data for these tokens">—</div>');
+})(), true);
+
+check('empty synthetic and unknown models are omitted', (() => {
+  const page = renderPage([{ ...sessions[0], cost: 0, usage: {}, models: {
+    '<synthetic>': {}, 'Unknown model': {}
+  } }]);
+  return !page.includes('&lt;synthetic&gt;') && !page.includes('Unknown model');
+})(), true);
+
+check('unpriced sessions are excluded consistently from model cost rows', (() => {
+  const model = { input_tokens: 1000, cached_input_tokens: 800, output_tokens: 10 };
+  const page = renderPage([
+    { ...sessions[0], provider: 'codex', id: 'priced', cost: 1,
+      usage: model, models: { 'gpt-test': model } },
+    { ...sessions[1], provider: 'codex', id: 'unpriced', cost: null,
+      usage: { input_tokens: 9000, cached_input_tokens: 8000, output_tokens: 90 },
+      models: { 'gpt-test': {
+        input_tokens: 9000, cached_input_tokens: 8000, output_tokens: 90
+      } } }
+  ]);
+  const details = page.match(/<details class="usage-models">([\s\S]*?)<\/details>/)[1];
+  return details.includes('>1,000</div>') && !details.includes('>10,000</div>');
+})(), true);
+
+check('the per-model usage breakdown is collapsible', (() => {
+  const page = renderPage([{ ...sessions[0], model: 'claude-test', cost: 2,
+    usage: { input_tokens: 10, output_tokens: 2 },
+    models: { 'claude-test': { input_tokens: 10, output_tokens: 2 } } }]);
+  return page.includes('<details class="usage-models">') &&
+    page.includes('<div class="usage-model-grid">') &&
+    page.includes('By model (1)') && page.includes('claude-test');
+})(), true);
+
+check('model rows use a nested grid instead of making details a subgrid',
+  html.includes('.usage-models {\n    display: grid;'), false);
 
 check('a title with markup in it is escaped', (() => {
   writeSession('-Users-me-buildgit-x', 'xss', [

@@ -1944,7 +1944,7 @@ async function runJsonMode(command, id, options) {
     // would be misleading in its UI; the id is what it addresses sessions by.
     const sessions = [...listSessions(deps), ...(await listCodexSessions())]
       .sort((a, b) => (b.started || '').localeCompare(a.started || ''))
-      .map(({ file, billingThreadIds, parentId, internal, ...rest }) => rest);
+      .map(({ file, billingThreadIds, billingThreads, parentId, internal, ...rest }) => rest);
     process.stdout.write(JSON.stringify({ sessions }));
     return;
   }

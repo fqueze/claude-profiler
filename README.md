@@ -39,6 +39,18 @@ Each row is a session — what it was about, where it ran, when it started, how
 long it actually worked, and its measured usage. Every row has a **Profiler**
 button. Claude rows report calculated dollar cost; for a signed-in Enterprise
 account, Codex rows report backend dollars.
+Above the session table, an overall usage row and one row per provider report
+cost, input and output tokens, cache writes, cache reads, and the cached share
+of input-side tokens. A collapsible section breaks the same totals down by
+model. Codex currently emits zero for its cache-write counter, so its write
+figures are visibly marked estimates derived from input tokens minus cache
+reads; exact reported values take precedence when available.
+The effective $/M figure divides actual cost by input plus output tokens. It is
+the blended, cache-amortized price of processing one million tokens, so cache
+reuse lowers it while costly output and model choice remain reflected in it. An
+effective rate always uses the same billed sessions for both dollars and
+tokens; unpriced sessions remain in overall/provider usage totals but are left
+out of the per-model cost comparison.
 Sort by any column to find the session worth looking at: the expensive one, the
 long one, or the one with sub-agents.
 
@@ -78,7 +90,8 @@ items. Spawned-agent costs are included
 in their root session. The API is best-effort: when offline, signed out, or when
 the backend omits an old thread, the row leaves cost blank rather than treating
 unavailable billing data as zero. Locally recorded tokens remain available in
-the JSON session summary, but are omitted from the table to keep it compact.
+the JSON session summary and are included in the totals above the table, while
+remaining out of each session row to keep the table compact.
 
 Clicking a column header sorts by it, so "which session cost the most" and
 "which one ran the most sub-agents" are one click each. The checkbox at the top

@@ -59,6 +59,17 @@ model rows, and the model rows within each provider, keeping Total fixed.
 Sort by any column to find the session worth looking at: the expensive one, the
 long one, or the one with sub-agents.
 
+Above the table, a collapsed **Usage over time** section re-aggregates the same
+figures by day, calendar month, half-year (H1/H2) or a single grand total, and
+each bucket opens onto its own per-model breakdown. **Day** is a calendar:
+weeks stack Monday-first, Saturday and Sunday columns appear only when a
+session in the displayed range falls on one, each week carries its own cost and
+session count, and clicking a day opens its full usage row and model rows
+beneath the week. A **From**/**To** date pair narrows the aggregation to a
+chosen period; the sums are recomputed in the browser, so changing the dates or
+the bucket does not reload the page. Buckets and boundaries are local time, and
+the section is closed until it is asked for.
+
 To look at another machine instead, give its name. Anything you can `ssh`
 into works, and the sessions are listed and profiled the same way:
 

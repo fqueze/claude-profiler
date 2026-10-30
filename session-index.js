@@ -167,6 +167,30 @@ function addTotals(total, usage, cost = 0, credits = null) {
   }
 }
 
+// Folds one already-totalled bucket into another, with addTotals' semantics.
+// The calendar sums a week from its days' totals rather than re-reading every
+// session, so it needs the same completeness flags and priced-token split.
+function mergeTotals(target, source) {
+  target.cost += source.cost;
+  target.costComplete = target.costComplete && source.costComplete;
+  target.pricedTokens += source.pricedTokens;
+  target.unpricedTokens += source.unpricedTokens;
+  if (source.creditsAvailable) {
+    target.credits += source.credits;
+    target.creditsAvailable = true;
+  }
+  for (const key of ['input', 'output', 'newInput', 'cacheRead']) {
+    target[key] += source[key];
+  }
+  if (source.cacheWriteAvailable) {
+    target.cacheWrite += source.cacheWrite;
+    target.cacheWriteAvailable = true;
+    target.cacheWriteEstimated ||= source.cacheWriteEstimated;
+    target.cacheWriteFromApi ||= source.cacheWriteFromApi;
+  }
+  return target;
+}
+
 function cachedPercent(total) {
   return total.input > 0 ? `${(100 * total.cacheRead / total.input).toFixed(1)}%` : '—';
 }
@@ -244,11 +268,11 @@ function usageSortAttributes(total) {
     `data-usage-sort${index}="${escapeHtml(key)}"`).join(' ');
 }
 
-function usageRow(total, className = '', expandable = false) {
-  return `<div class="usage-row ${className}" role="row" ${usageSortAttributes(total)}${
-    expandable ? ' tabindex="0" aria-expanded="false"' : ''}>
-    <div class="usage-label" role="rowheader">${escapeHtml(total.label)}</div>
-    <div role="cell"${total.costComplete ? '' : ' title="Some costs are unavailable"'}>${formatTotalCost(total)}</div>
+// The figures of a usage row, without the label. Split out so that the period
+// table can render its own label cell — the period and its session count —
+// around exactly the same cells as the summary.
+function usageCells(total) {
+  return `<div role="cell"${total.costComplete ? '' : ' title="Some costs are unavailable"'}>${formatTotalCost(total)}</div>
     ${creditCell(total)}
     ${tokenCell(total.input)}
     ${tokenCell(total.output)}
@@ -262,8 +286,47 @@ function usageRow(total, className = '', expandable = false) {
       : '<div role="cell" title="Not reported by this provider">—</div>'}
     ${tokenCell(total.cacheRead)}
     <div role="cell">${cachedPercent(total)}</div>
-    ${effectiveRateCell(total)}
+    ${effectiveRateCell(total)}`;
+}
+
+function usageRow(total, className = '', expandable = false) {
+  return `<div class="usage-row ${className}" role="row" ${usageSortAttributes(total)}${
+    expandable ? ' tabindex="0" aria-expanded="false"' : ''}>
+    <div class="usage-label" role="rowheader">${escapeHtml(total.label)}</div>
+    ${usageCells(total)}
   </div>`;
+}
+
+// What each model contributed to a session's totals. Models without a cost of
+// their own share what the ones with an exact cost leave of the session's, in
+// proportion to their tokens. Resolved here rather than in the page so that a
+// period bucket splits a session the same way the summary above it does.
+function modelContributions(provider, session) {
+  const entries = Object.entries(session.billingModels || session.models || {});
+  const modelEntries = entries.length ? entries : [[session.model || 'Unknown model',
+    session.billingUsage || session.usage]];
+  const exact = ([, modelUsage]) => Number.isFinite(modelUsage?.cost);
+  const weights = modelEntries.map(entry => {
+    if (exact(entry)) return 0;
+    const normalized = normalizedUsage(provider, entry[1]);
+    return normalized.input + normalized.output;
+  });
+  const weightTotal = weights.reduce((sum, value) => sum + value, 0);
+  const unattributed = modelEntries.filter(entry => !exact(entry)).length;
+  const remainingCost = Math.max(0, (session.cost ?? 0) -
+    modelEntries.filter(exact).reduce((sum, [, modelUsage]) => sum + modelUsage.cost, 0));
+
+  return modelEntries.map(([model, modelUsage], index) => ({
+    model,
+    provider,
+    usage: normalizedUsage(provider, modelUsage),
+    cost: Number.isFinite(modelUsage?.cost)
+      ? modelUsage.cost
+      : session.cost === null || session.cost === undefined ? null
+        : remainingCost *
+          (weightTotal > 0 ? weights[index] / weightTotal : 1 / unattributed),
+    credits: provider === 'codex' ? modelUsage?.credits : null
+  }));
 }
 
 function usageSummary(sessions) {
@@ -282,34 +345,15 @@ function usageSummary(sessions) {
     addTotals(total, usage, session.cost, credits);
     addTotals(providers[provider], usage, session.cost, credits);
 
-    const entries = Object.entries(session.billingModels || session.models || {});
-    const modelEntries = entries.length ? entries : [[session.model || 'Unknown model',
-      session.billingUsage || session.usage]];
-    // Models without a cost of their own share what the ones with an exact
-    // cost leave of the session's, in proportion to their tokens.
-    const exact = ([, modelUsage]) => Number.isFinite(modelUsage?.cost);
-    const weights = modelEntries.map(entry => {
-      if (exact(entry)) return 0;
-      const normalized = normalizedUsage(provider, entry[1]);
-      return normalized.input + normalized.output;
-    });
-    const weightTotal = weights.reduce((sum, value) => sum + value, 0);
-    const unattributed = modelEntries.filter(entry => !exact(entry)).length;
-    const remainingCost = Math.max(0, (session.cost ?? 0) -
-      modelEntries.filter(exact).reduce((sum, [, modelUsage]) => sum + modelUsage.cost, 0));
-
-    modelEntries.forEach(([model, modelUsage], index) => {
+    for (const contribution of modelContributions(provider, session)) {
       // An unpriced session's tokens still count; its cost is unknown, which
       // the row shows, and the $/M figure only divides the priced ones.
-      const key = `${provider}:${model}`;
-      if (!models.has(key)) models.set(key, emptyTotals(modelLabel(model), provider));
-      const share = weightTotal > 0 ? weights[index] / weightTotal : 1 / unattributed;
-      const modelCost = Number.isFinite(modelUsage?.cost)
-        ? modelUsage.cost
-        : session.cost === null || session.cost === undefined ? null : remainingCost * share;
-      addTotals(models.get(key), normalizedUsage(provider, modelUsage), modelCost,
-        provider === 'codex' ? modelUsage?.credits : null);
-    });
+      const key = `${contribution.provider}:${contribution.model}`;
+      if (!models.has(key)) {
+        models.set(key, emptyTotals(modelLabel(contribution.model), contribution.provider));
+      }
+      addTotals(models.get(key), contribution.usage, contribution.cost, contribution.credits);
+    }
   }
 
   const used = totals => totals.input + totals.output > 0 || totals.cost > 0;
@@ -319,6 +363,86 @@ function usageSummary(sessions) {
       .filter(model => model.provider === provider.provider && used(model))
       .sort((a, b) => b.cost - a.cost || a.label.localeCompare(b.label))
   })) };
+}
+
+// The minimal per-session record the page buckets by date. The two non-obvious
+// pieces — normalizing a provider's usage shape and splitting a session's cost
+// across models — are resolved here, so the page script only sums and formats.
+function periodSessions(sessions) {
+  return sessions.map(session => {
+    const provider = providerOf(session);
+    return {
+      started: session.started || null,
+      provider,
+      cost: Number.isFinite(session.cost) ? session.cost : null,
+      credits: provider === 'codex' && Number.isFinite(session.credits)
+        ? session.credits : null,
+      usage: normalizedUsage(provider, session.billingUsage || session.usage),
+      models: modelContributions(provider, session)
+        // The summary omits models that contributed nothing, and the page would
+        // filter them out anyway; not shipping them keeps the payload honest.
+        .filter(contribution => contribution.usage.input + contribution.usage.output > 0 ||
+          contribution.cost > 0)
+        .map(contribution => ({
+          ...contribution,
+          // A period bucket opens onto model rows that have no provider row above
+          // them, so they carry the label the summary's model rows would have.
+          label: modelLabel(contribution.model)
+        }))
+    };
+  });
+}
+
+// The period table's header is plain labels: unlike the summary, its rows are
+// chronological and its columns are not sortable.
+function periodUsageHeader() {
+  return `<div class="usage-row usage-head" role="row">
+    ${USAGE_COLUMNS.map(column =>
+      `<div role="columnheader"${column.title ? ` title="${escapeHtml(column.title)}"` : ''}>` +
+      `${escapeHtml(column.label)}</div>`).join('')}
+  </div>`;
+}
+
+// The period aggregation runs in the browser, because the start and end dates
+// change without a round trip. These are the server's own usage helpers,
+// serialized into the page, so a period row formats its figures with the same
+// code as the summary above it rather than a copy that can drift.
+const CLIENT_USAGE_FUNCTIONS = [
+  escapeHtml, formatTokens, tokenCell, creditCell, formatTotalCost, cachedPercent,
+  effectiveRateCell, emptyTotals, addTotals, mergeTotals, costBands, costBand,
+  usageSortAttributes, usageCells, usageRow
+];
+
+// The collapsible "Usage over time" section. It is closed by default, so it
+// adds one line near the top of the page until it is asked for.
+function periodPanel(sessions) {
+  // The data is JSON inside a <script>, so any `<` is escaped: an unescaped
+  // `</script>` in a model name would end the block early.
+  const data = JSON.stringify(periodSessions(sessions))
+    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+
+  return `<details class="period-panel">
+  <summary>Usage over time</summary>
+  <div class="period-controls">
+    <span class="period-modes" role="radiogroup" aria-label="Aggregation period">
+      <label><input type="radio" name="period-mode" value="day"> Day</label>
+      <label><input type="radio" name="period-mode" value="month" checked> Month</label>
+      <label><input type="radio" name="period-mode" value="half"> Half-year</label>
+      <label><input type="radio" name="period-mode" value="total"> Total</label>
+    </span>
+    <label class="period-date">From <input type="date" id="period-start"></label>
+    <label class="period-date">To <input type="date" id="period-end"></label>
+    <button type="button" id="period-clear">Clear</button>
+  </div>
+  <div class="period-grid" role="table" id="period-grid"
+       aria-label="Usage by period">
+    ${periodUsageHeader()}
+  </div>
+  <div class="calendar" id="period-calendar" role="grid"
+       aria-label="Usage by day" hidden></div>
+  <p class="period-note" id="period-note"></p>
+  <script type="application/json" id="period-data">${data}</script>
+</details>`;
 }
 
 // In a provider's model rows, the provider's name is already on the row above.
@@ -370,15 +494,19 @@ function formatDuration(ms) {
 // Four bands rather than five: the palette's warning yellow and serious orange
 // measure ΔE 13.6 apart, below the floor at which they can be told apart even
 // with full colour vision, so the two middle tiers would have looked the same.
-const COST_BANDS = [
-  { over: 200, band: 'critical' },
-  { over: 50, band: 'warning' },
-  { over: 10, band: 'good' },
-  { over: 0, band: 'cheap' }
-];
+// A function rather than a constant so that the same source can be serialized
+// into the page for the calendar's day cells.
+function costBands() {
+  return [
+    { over: 200, band: 'critical' },
+    { over: 50, band: 'warning' },
+    { over: 10, band: 'good' },
+    { over: 0, band: 'cheap' }
+  ];
+}
 
 function costBand(cost) {
-  return (COST_BANDS.find(({ over }) => cost > over) || { band: 'cheap' }).band;
+  return (costBands().find(({ over }) => cost > over) || { band: 'cheap' }).band;
 }
 
 // Cost spans four orders of magnitude across a set of sessions, so the bar is
@@ -568,6 +696,98 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   .usage-model { display: none; color: var(--dim); }
   .usage-provider[aria-expanded="true"] ~ .usage-model { display: grid; }
   .usage-model .usage-label { font-weight: 400; padding-left: 1.5em; }
+  /* The collapsible period aggregation. It brings the summary's column widths
+     with it, since the panel is not inside .usage-summary, but its header is
+     not sortable and its model rows live in a grid of their own rather than in
+     a provider's expandable group. */
+  .period-panel {
+    margin: 1rem 0 1.5rem; overflow-x: auto;
+    border: 1px solid var(--line); border-radius: 6px;
+    --usage-columns: minmax(10rem, 1fr) repeat(9, minmax(5.5rem, auto));
+  }
+  .period-panel > summary {
+    cursor: pointer; user-select: none; color: var(--dim); font-weight: 600;
+    padding: .5rem .7rem;
+  }
+  .period-panel[open] > summary { border-bottom: 1px solid var(--line); }
+  .period-controls {
+    display: flex; align-items: center; gap: .5rem 1rem; flex-wrap: wrap;
+    padding: .6rem .7rem; color: var(--dim);
+  }
+  .period-modes { display: inline-flex; gap: .8rem; }
+  .period-modes label, .period-date {
+    display: inline-flex; align-items: center; gap: .3rem;
+  }
+  .period-date input {
+    font: inherit; color: inherit; background: transparent;
+    border: 1px solid var(--line); border-radius: 4px; padding: .15rem .3rem;
+  }
+  .period-controls button {
+    font-size: .85rem; width: auto; padding: .2rem .6rem;
+  }
+  /* The bucket's own row is set apart from the model rows it opens. */
+  .usage-period { background: var(--hover); font-weight: 600; }
+  .usage-period .hint { font-weight: 400; }
+  /* Both bodies are grids of their own, with the summary's column widths. */
+  .period-grid, .period-model-grid {
+    display: grid; grid-template-columns: var(--usage-columns); min-width: 68rem;
+  }
+  .period-models { grid-column: 1 / -1; border-top: 1px solid var(--line); }
+  .period-models summary {
+    cursor: pointer; color: var(--dim); padding: .45rem .7rem; user-select: none;
+  }
+  .period-models[open] summary { border-bottom: 1px solid var(--line); }
+  .period-model { color: var(--dim); }
+  .period-model .usage-label { font-weight: 400; padding-left: 1.5em; }
+  /* The calendar replaces the day list: weeks stacked, weekdays as columns.
+     --cal-columns is set by the script, since the weekend columns appear only
+     when the displayed range has a weekend session. */
+  .calendar { min-width: 68rem; padding: .6rem .7rem; }
+  .cal-head, .cal-week {
+    display: grid; grid-template-columns: var(--cal-columns);
+    column-gap: .4rem; align-items: stretch;
+  }
+  .cal-head { color: var(--dim); font-size: .82rem; padding-bottom: .3rem; }
+  .cal-head > div { text-align: center; }
+  .cal-head .cal-week-head { text-align: right; }
+  .cal-week { margin-bottom: .4rem; }
+  .cal-week-label {
+    align-self: center; white-space: nowrap; color: var(--dim); font-size: .82rem;
+  }
+  /* A day cell is a button, so clicking it opens the day's full row below the
+     week. Empty days keep their number to hold the calendar's shape. */
+  .cal-day {
+    display: flex; flex-direction: column; align-items: flex-start;
+    gap: .15rem; min-height: 3.6rem; width: auto; padding: .35rem .45rem;
+    border: 1px solid var(--line); border-radius: 5px; background: transparent;
+    color: inherit; font: inherit; text-align: left;
+  }
+  .cal-day:not(.empty) { cursor: pointer; }
+  .cal-day:not(.empty):hover { background: var(--hover); color: var(--fg); }
+  .cal-day.empty { border-style: dashed; opacity: .55; }
+  .cal-day .cal-date { color: var(--dim); font-size: .8rem; }
+  .cal-day .cal-cost, .cal-week-total .cal-cost {
+    font-weight: 600; font-variant-numeric: tabular-nums;
+  }
+  .cal-cost.cheap { color: var(--cost-cheap); }
+  .cal-cost.good { color: var(--cost-good); }
+  .cal-cost.warning { color: var(--cost-warning); }
+  .cal-cost.critical { color: var(--cost-critical); }
+  .cal-sessions { color: var(--dim); font-size: .78rem; white-space: nowrap; }
+  .cal-week-total {
+    display: flex; flex-direction: column; align-items: flex-end;
+    justify-content: center; gap: .15rem; white-space: nowrap;
+  }
+  /* The expanded day uses the summary's own grid, so its figures line up. */
+  .cal-detail {
+    grid-column: 1 / -1; margin: .35rem 0 .1rem;
+    border-top: 1px dashed var(--line);
+  }
+  .period-note { margin: 0; padding: .5rem .7rem; color: var(--dim); }
+  .period-note:empty { display: none; }
+  /* Both bodies carry a display value of their own, so the hidden attribute
+     needs a rule with the same weight to actually take them off the page. */
+  .period-grid[hidden], .calendar[hidden] { display: none; }
   .options {
     margin-bottom: 1rem; display: flex; align-items: center;
     gap: .5rem 1rem; flex-wrap: wrap;
@@ -664,6 +884,8 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   <strong>${sessions.length}</strong> session${sessions.length === 1 ? '' : 's'} ·
   <strong>${formatBytes(totalBytes)}</strong>
 </div>
+
+${periodPanel(sessions)}
 
 <section class="usage-summary" aria-label="Usage totals">
   <div class="usage-grid" role="table">
@@ -866,6 +1088,296 @@ ${sessions.length === 0
       button.disabled = false;
     }
   });
+
+  // --- Usage over time ------------------------------------------------------
+  // The period table sums the embedded per-session records in the browser, so
+  // the dates can be changed without asking the server for a new page. The
+  // formatting helpers below are the server's own, serialized in above, which
+  // is why a period row looks exactly like a summary row.
+${CLIENT_USAGE_FUNCTIONS.map(fn => fn.toString()).join('\n\n')}
+
+  const periodData = JSON.parse(document.getElementById('period-data').textContent);
+  const periodGrid = document.getElementById('period-grid');
+  const periodCalendar = document.getElementById('period-calendar');
+  const periodNote = document.getElementById('period-note');
+  const periodStart = document.getElementById('period-start');
+  const periodEnd = document.getElementById('period-end');
+
+  function periodMode() {
+    return document.querySelector('input[name="period-mode"]:checked').value;
+  }
+
+  // Boundaries are local, like the date inputs: bucketing in UTC would move a
+  // late-evening session into the next day for most of the world.
+  function periodKey(date, mode) {
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    if (mode === 'day') {
+      return year + '-' + String(month + 1).padStart(2, '0') + '-' +
+        String(date.getDate()).padStart(2, '0');
+    }
+    if (mode === 'month') return year + '-' + String(month + 1).padStart(2, '0');
+    if (mode === 'half') return year + '-H' + (month < 6 ? 1 : 2);
+    return 'total';
+  }
+
+  function periodLabel(date, mode) {
+    if (mode === 'day') return date.toLocaleDateString([], { dateStyle: 'medium' });
+    if (mode === 'month') {
+      return date.toLocaleDateString([], { year: 'numeric', month: 'long' });
+    }
+    if (mode === 'half') return date.getFullYear() + ' H' + (date.getMonth() < 6 ? 1 : 2);
+    return 'Total';
+  }
+
+  function periodRow(bucket) {
+    return '<div class="usage-row usage-period" role="row" ' +
+      usageSortAttributes(bucket.total) + '>' +
+      '<div class="usage-label" role="rowheader">' + escapeHtml(bucket.label) +
+      '<span class="hint">' + bucket.count + ' session' +
+      (bucket.count === 1 ? '' : 's') + '</span></div>' +
+      usageCells(bucket.total) + '</div>';
+  }
+
+  // --- The day calendar -----------------------------------------------------
+  // Day mode is a calendar rather than a list: one row per week, Monday first,
+  // weekday columns, and a day cell that opens its full usage row and model
+  // breakdown beneath the week.
+  const WEEKDAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+  const WEEKDAY_POSITION = { 0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5 };
+
+  function addDays(date, days) {
+    const shifted = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    shifted.setDate(shifted.getDate() + days);
+    return shifted;
+  }
+
+  // The Monday on or before the given date.
+  function startOfWeek(date) {
+    const start = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    start.setDate(start.getDate() - WEEKDAY_POSITION[start.getDay()]);
+    return start;
+  }
+
+  function daysOfWeek(weekday, count) {
+    return Array.from({ length: count }, (unused, position) =>
+      addDays(weekday, position));
+  }
+
+  function weekLabel(start, count) {
+    const last = addDays(start, count - 1);
+    const first = start.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const sameMonth = start.getMonth() === last.getMonth() &&
+      start.getFullYear() === last.getFullYear();
+    const end = sameMonth ? String(last.getDate())
+      : last.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return first + '–' + end;
+  }
+
+  function costCell(total) {
+    return '<span class="cal-cost ' + costBand(total.cost) + '">' +
+      formatTotalCost(total) + '</span>';
+  }
+
+  function countCell(count) {
+    return '<span class="cal-sessions">' + count + ' session' +
+      (count === 1 ? '' : 's') + '</span>';
+  }
+
+  function modelDetails(bucket) {
+    const models = [...bucket.models.values()]
+      .filter(model => model.input + model.output > 0 || model.cost > 0)
+      .sort((a, b) => b.cost - a.cost || a.label.localeCompare(b.label));
+    if (!models.length) return '';
+    return '<details class="period-models"><summary>By model (' + models.length +
+      ')</summary><div class="period-model-grid">' +
+      models.map(model => usageRow(model, 'period-model ' + model.provider))
+        .join('') + '</div></details>';
+  }
+
+  // The day's full row lives inside the week, hidden until its cell is clicked.
+  function dayDetail(bucket) {
+    return '<div class="cal-detail" data-detail="' + bucket.key + '" hidden>' +
+      '<div class="period-grid" role="table">' +
+      usageRow(bucket.total, 'usage-period') + modelDetails(bucket) +
+      '</div></div>';
+  }
+
+  function renderCalendar(dated) {
+    const byDay = new Map(dated.map(bucket => [bucket.key, bucket]));
+    // Weekend columns appear only when something in the displayed range
+    // happened on one, so a work-only history reads as five columns.
+    const hasWeekend = dated.some(bucket => {
+      const day = bucket.date.getDay();
+      return day === 0 || day === 6;
+    });
+    const weekdays = hasWeekend ? WEEKDAY_ORDER : WEEKDAY_ORDER.slice(0, 5);
+
+    // Weeks are built from the days that have content, so a long quiet stretch
+    // does not become a stack of empty rows.
+    const weeks = new Map();
+    for (const bucket of dated) {
+      const start = startOfWeek(bucket.date);
+      const key = periodKey(start, 'day');
+      if (!weeks.has(key)) {
+        weeks.set(key, { start, count: 0, total: emptyTotals('Week') });
+      }
+      const week = weeks.get(key);
+      week.count += bucket.count;
+      mergeTotals(week.total, bucket.total);
+    }
+
+    periodCalendar.style.setProperty('--cal-columns',
+      '10rem repeat(' + weekdays.length + ', minmax(7rem, 1fr)) 9.5rem');
+
+    const head = '<div class="cal-head" role="row"><div></div>' +
+      weekdays.map(day => '<div role="columnheader">' +
+        WEEKDAY_NAMES[WEEKDAY_POSITION[day]] + '</div>').join('') +
+      '<div class="cal-week-head" role="columnheader">Week</div></div>';
+
+    const body = [...weeks.values()]
+      .sort((a, b) => a.start - b.start)
+      .map(week => {
+        const dates = daysOfWeek(week.start, weekdays.length);
+        const cells = dates.map(date => {
+          const bucket = byDay.get(periodKey(date, 'day'));
+          if (!bucket) {
+            return '<div class="cal-day empty" role="gridcell">' +
+              '<span class="cal-date">' + date.getDate() + '</span></div>';
+          }
+          return '<button type="button" class="cal-day" role="gridcell" ' +
+            'data-day="' + bucket.key + '" aria-expanded="false" aria-label="' +
+            escapeHtml(bucket.label + ', ' + bucket.count + ' session' +
+              (bucket.count === 1 ? '' : 's') + ', ' +
+              formatTotalCost(bucket.total)) + '">' +
+            '<span class="cal-date">' + date.getDate() + '</span>' +
+            costCell(bucket.total) + countCell(bucket.count) + '</button>';
+        }).join('');
+
+        const details = dates.map(date => {
+          const bucket = byDay.get(periodKey(date, 'day'));
+          return bucket ? dayDetail(bucket) : '';
+        }).join('');
+
+        return '<div class="cal-week" role="row">' +
+          '<div class="cal-week-label">' +
+          escapeHtml(weekLabel(week.start, weekdays.length)) + '</div>' +
+          cells +
+          '<div class="cal-week-total" role="gridcell">' +
+          costCell(week.total) + countCell(week.count) + '</div>' +
+          details + '</div>';
+      }).join('');
+
+    periodCalendar.innerHTML = head + body;
+  }
+
+  function renderPeriods() {
+    const mode = periodMode();
+    const start = periodStart.value ? new Date(periodStart.value + 'T00:00:00') : null;
+    const end = periodEnd.value ? new Date(periodEnd.value + 'T23:59:59.999') : null;
+    const bounded = start !== null || end !== null;
+    const buckets = new Map();
+
+    for (const record of periodData) {
+      const date = record.started ? new Date(record.started) : null;
+      const valid = date !== null && !isNaN(date);
+      const time = valid ? date.getTime() : null;
+      // A session with no date can still be totalled, but it cannot be placed
+      // inside a bounded range.
+      if (bounded && !valid) continue;
+      if (start !== null && time < start.getTime()) continue;
+      if (end !== null && time > end.getTime()) continue;
+
+      const key = valid ? periodKey(date, mode) : '';
+      if (!buckets.has(key)) {
+        buckets.set(key, {
+          key,
+          date: valid ? date : null,
+          label: valid ? periodLabel(date, mode) : 'Unknown date',
+          count: 0,
+          total: emptyTotals(valid ? periodLabel(date, mode) : 'Unknown date'),
+          models: new Map()
+        });
+      }
+
+      const bucket = buckets.get(key);
+      bucket.count++;
+      addTotals(bucket.total, record.usage, record.cost, record.credits);
+      for (const contribution of record.models) {
+        const modelKey = contribution.provider + ':' + contribution.model;
+        if (!bucket.models.has(modelKey)) {
+          bucket.models.set(modelKey,
+            emptyTotals(contribution.label || contribution.model, contribution.provider));
+        }
+        addTotals(bucket.models.get(modelKey), contribution.usage,
+          contribution.cost, contribution.credits);
+      }
+    }
+
+    // Sorted on the raw key, not the localized label: "Sep 2" reads after
+    // "Sep 10" alphabetically, and months would sort by name.
+    const ordered = [...buckets.values()].sort((a, b) => {
+      if (a.key === '') return 1;
+      if (b.key === '') return -1;
+      return a.key.localeCompare(b.key);
+    });
+    const dated = ordered.filter(bucket => bucket.key !== '');
+    const unknown = buckets.get('');
+    const sessions = ordered.reduce((sum, bucket) => sum + bucket.count, 0);
+
+    if (mode === 'day') {
+      renderCalendar(dated);
+      periodGrid.hidden = true;
+      periodCalendar.hidden = dated.length === 0;
+      if (!dated.length) {
+        periodNote.textContent = unknown
+          ? 'No dated sessions; ' + unknown.count + ' with no date.'
+          : 'No sessions in this range.';
+      } else {
+        const notes = [sessions + (sessions === 1 ? ' session' : ' sessions') +
+          ' across ' + dated.length + (dated.length === 1 ? ' day' : ' days') +
+          ', dates in local time'];
+        if (unknown) notes.push(unknown.count + ' with no date');
+        periodNote.textContent = notes.join('; ');
+      }
+      return;
+    }
+
+    periodCalendar.hidden = true;
+    periodGrid.hidden = false;
+    const rows = ordered.map(bucket => periodRow(bucket) + modelDetails(bucket));
+
+    // The header is the grid's first child; everything after it is re-rendered.
+    while (periodGrid.children.length > 1) periodGrid.lastElementChild.remove();
+    periodGrid.insertAdjacentHTML('beforeend', rows.join(''));
+    periodNote.textContent = ordered.length
+      ? sessions + ' sessions, dates in local time'
+      : 'No sessions in this range.';
+  }
+
+  for (const input of document.querySelectorAll('input[name="period-mode"]')) {
+    input.addEventListener('change', renderPeriods);
+  }
+  for (const input of [periodStart, periodEnd]) {
+    input.addEventListener('change', renderPeriods);
+  }
+  document.getElementById('period-clear').addEventListener('click', () => {
+    periodStart.value = '';
+    periodEnd.value = '';
+    renderPeriods();
+  });
+  // Delegated, since re-rendering replaces the calendar's cells.
+  periodCalendar.addEventListener('click', event => {
+    const button = event.target.closest('button.cal-day');
+    if (!button || !button.dataset.day) return;
+    const detail = periodCalendar.querySelector(
+      '[data-detail="' + button.dataset.day + '"]');
+    if (!detail) return;
+    detail.hidden = !detail.hidden;
+    button.setAttribute('aria-expanded', String(!detail.hidden));
+  });
+  renderPeriods();
 </script>
 `;
 }

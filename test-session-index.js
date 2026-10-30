@@ -338,9 +338,11 @@ check('a provider row expands into its model rows, without the claude- prefix', 
   const page = renderPage([{ ...sessions[0], model: 'claude-test', cost: 2,
     usage: { input_tokens: 10, output_tokens: 2 },
     models: { 'claude-test': { input_tokens: 10, output_tokens: 2 } } }]);
+  const start = page.indexOf('<section class="usage-summary"');
+  const summary = page.slice(start, page.indexOf('</section>', start));
   return /<div class="usage-group" role="rowgroup"[^>]*>\s*<div class="usage-row usage-provider claude" role="row" [^>]*tabindex="0" aria-expanded="false">/.test(page) &&
     /usage-model"[^>]*>\s*<div class="usage-label" role="rowheader">test</.test(page) &&
-    !page.includes('<details');
+    !summary.includes('<details');
 })(), true);
 
 check('providers with no usage are not listed', (() => {
@@ -363,6 +365,111 @@ check('the usage header sorts the provider groups and every usage column', (() =
     rows.length === 3 && rows.every(attributes => [...Array(10).keys()].every(index =>
       attributes.includes(`data-usage-sort${index}=`))) &&
     page.includes("document.querySelectorAll('.usage-group')");
+})(), true);
+
+// --- Usage over time -------------------------------------------------------
+
+// The aggregation is a menu item, not a headline: closed, and above the fixed
+// summary, so the totals the page always showed stay where they were.
+check('the usage-over-time panel is near the top and closed by default', (() => {
+  const panel = html.indexOf('<details class="period-panel">');
+  const summary = html.indexOf('<section class="usage-summary"');
+  return panel !== -1 && panel < summary && !/class="period-panel"[^>]*\sopen/.test(html);
+})(), true);
+
+check('the panel offers day, month, half-year and total buckets', (() => {
+  const panel = html.match(
+    /<details class="period-panel">[\s\S]*?<div class="period-grid"/)[0];
+  return ['value="day"', 'value="month"', 'value="half"', 'value="total"',
+    'value="month" checked', 'id="period-start"', 'id="period-end"']
+    .every(needle => panel.includes(needle));
+})(), true);
+
+// The browser sums these records, so they carry provider-normalized usage and
+// the model split the server already resolved.
+check('the page embeds a normalized usage record per session', (() => {
+  const raw = html.match(
+    /<script type="application\/json" id="period-data">([\s\S]*?)<\/script>/)[1];
+  const data = JSON.parse(raw);
+  const alpha = data.find(record => record.provider === 'claude' &&
+    record.models.some(model => model.model === 'claude-test'));
+  return data.length === sessions.length && alpha !== undefined &&
+    alpha.usage.input === 13 + 3 + 85 && alpha.usage.output === 4 &&
+    alpha.usage.newInput === 16 &&
+    alpha.cost === sessions.find(session => session.id === 'aaaa').cost;
+})(), true);
+
+// A `<` inside the JSON — a model name, say — must not be able to close the
+// script block it lives in.
+check('the embedded period data escapes angle brackets', (() => {
+  const page = renderPage([{ ...sessions[0], model: '<script>alert(1)</script>',
+    cost: 1, usage: { input_tokens: 1, output_tokens: 1 },
+    models: { '<script>alert(1)</script>': { input_tokens: 1, output_tokens: 1 } } }]);
+  const raw = page.match(
+    /<script type="application\/json" id="period-data">([\s\S]*?)<\/script>/)[1];
+  return !/[<>]/.test(raw) &&
+    JSON.parse(raw)[0].models[0].model === '<script>alert(1)</script>';
+})(), true);
+
+// The summary's sorter reorders .usage-group elements and the .usage-model rows
+// inside them, so period rows carry classes of their own and a grid of their
+// own: sweeping one into the other would reorder the wrong table.
+check('period rows stay out of the summary sorter', (() => {
+  const panel = html.slice(html.indexOf('<details class="period-panel">'),
+    html.indexOf('<section class="usage-summary"'));
+  return !/class="[^"]*\b(?:usage-grid|usage-group|usage-model)\b/.test(panel) &&
+    panel.includes('class="period-grid"') &&
+    html.includes("usageRow(model, 'period-model ' + model.provider)") &&
+    html.includes("usageRow(bucket.total, 'usage-period')");
+})(), true);
+
+check('the period table reuses the server usage helpers', (() => {
+  return html.includes('function usageCells(total)') &&
+    html.includes('function addTotals(total, usage, cost = 0, credits = null)') &&
+    html.includes('function mergeTotals(target, source)') &&
+    html.includes('function periodRow(bucket)');
+})(), true);
+
+// The panel is outside .usage-summary, so it has to bring the grid columns
+// with it or its rows lose every column but the first.
+check('the period panel defines the usage columns it inherits', (() => {
+  const panel = html.slice(html.indexOf('.period-panel {'),
+    html.indexOf('.period-controls {'));
+  return panel.includes('--usage-columns:');
+})(), true);
+
+// --- The day calendar ------------------------------------------------------
+
+// Day mode is a calendar, which means it replaces the day list rather than
+// adding to it; both bodies start out of the way and the script picks one.
+check('the calendar is a separate, hidden body until day mode asks for it', (() => {
+  return /id="period-calendar"[^>]*hidden/.test(html) &&
+    html.includes('if (mode === \'day\')') &&
+    html.includes('periodGrid.hidden = true') &&
+    html.includes('.period-grid[hidden], .calendar[hidden] { display: none; }');
+})(), true);
+
+check('the calendar stacks Monday-first weeks, weekend only when needed', (() => {
+  const script = html.slice(html.indexOf('<script>'));
+  return script.includes('const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];') &&
+    script.includes('WEEKDAY_ORDER.slice(0, 5)') &&
+    script.includes("'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'") &&
+    script.includes('--cal-columns');
+})(), true);
+
+check('a day cell opens its full usage row and per-model breakdown', (() => {
+  const script = html.slice(html.indexOf('<script>'));
+  return script.includes('function dayDetail(bucket)') &&
+    script.includes("usageRow(bucket.total, 'usage-period')") &&
+    script.includes('function modelDetails(bucket)') &&
+    script.includes("event.target.closest('button.cal-day')");
+})(), true);
+
+// The page script is assembled from template strings and serialized functions,
+// so a stray backtick or brace is a syntax error only the browser would see.
+check('the generated page script compiles', (() => {
+  new Function(html.match(/<script>([\s\S]*?)<\/script>/)[1]);
+  return true;
 })(), true);
 
 check('a title with markup in it is escaped', (() => {

@@ -391,12 +391,18 @@ function costBar(cost, maxCost) {
   return Math.max(3, Math.round(100 * Math.sqrt(cost / maxCost)));
 }
 
+function folderIcon(session) {
+  return `<span class="folder s${session.colorSlot}">` +
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 4a1.25 1.25 0 0 1 1.25-1.25h3.1l1.5 1.75H13a1.25 1.25 0 0 1 1.25 1.25v6.5A1.25 1.25 0 0 1 13 13.5H3a1.25 1.25 0 0 1-1.25-1.25z M1.75 6.75h12.5"/></svg>' +
+    '</span>';
+}
+
 function sessionRow(session, maxCost) {
   const provider = providerOf(session);
   const models = sessionModels(session);
   const cells = [
     `<td class="title" title="${escapeHtml(session.title)}">
-       <span class="dot s${session.colorSlot}"></span>${escapeHtml(session.title)}
+       ${escapeHtml(session.title)}
      </td>`,
     `<td class="model">${models.map(escapeHtml).join('<br>') || '—'}</td>`,
     `<td class="date" data-value="${escapeHtml(session.ended || '')}"></td>`,
@@ -441,7 +447,7 @@ function sessionRow(session, maxCost) {
   return `<tbody ${sortAttrs}>
     <tr class="figures">${cells.join('')}</tr>
     <tr class="path">
-      <td colspan="${COLUMNS.length - 3}">${escapeHtml(session.cwd)}${
+      <td colspan="${COLUMNS.length - 3}">${folderIcon(session)}${escapeHtml(session.cwd)}${
         session.gitBranch ? ` · ${escapeHtml(session.gitBranch)}` : ''
       }</td>
       <td class="meter" colspan="2">
@@ -610,17 +616,20 @@ function renderPage(sessions, { size = false, host = null } = {}) {
   td.title { min-width: 12rem; }
   tr.path td { color: var(--dim); font-size: .85em; font-weight: 400; }
   td.title { max-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  /* A dot beside the title, never colour alone: the project path is spelled
-     out on the line below it. */
-  .dot {
-    display: inline-block; width: .5rem; height: .5rem; border-radius: 50%;
-    margin-right: .45rem; vertical-align: baseline; flex: none;
+  /* A folder in the project's colour, never colour alone: the path it stands
+     for is spelled out right after it. */
+  .folder { display: inline-block; margin-right: .35rem; vertical-align: -.25em; }
+  /* Outlined rather than filled: at this size a solid shape reads as a blob,
+     while the outline and the flap line read as a folder. */
+  .folder svg {
+    display: block; width: 1.25em; height: 1.25em;
+    fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round;
   }
   td.model { color: var(--dim); white-space: nowrap; }
-  .s0 { background: var(--s0); } .s1 { background: var(--s1); }
-  .s2 { background: var(--s2); } .s3 { background: var(--s3); }
-  .s4 { background: var(--s4); } .s5 { background: var(--s5); }
-  .s6 { background: var(--s6); } .s7 { background: var(--s7); }
+  .s0 { color: var(--s0); } .s1 { color: var(--s1); }
+  .s2 { color: var(--s2); } .s3 { color: var(--s3); }
+  .s4 { color: var(--s4); } .s5 { color: var(--s5); }
+  .s6 { color: var(--s6); } .s7 { color: var(--s7); }
 
   /* The bar grows leftward from the figure, which keeps the numbers aligned in
      a column of their own while the bar reads as a row-length magnitude. A

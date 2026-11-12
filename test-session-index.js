@@ -384,8 +384,8 @@ check('each project gets its own colour slot',
 check('colour follows the project, not the row order', (() => {
   const reversed = renderPage([...sessions].reverse());
   const forOne = (page, id) =>
-    page.match(new RegExp(`<tbody [^>]*>(?:(?!</tbody>)[\\s\\S])*?data-id="claude:${id}"`))[0]
-      .match(/class="dot (s\d)"/)[1];
+    page.match(new RegExp(`<tbody [^>]*>(?:(?!</tbody>)[\\s\\S])*?data-id="claude:${id}"(?:(?!</tbody>)[\\s\\S])*`))[0]
+      .match(/class="folder (s\d)"/)[1];
   return forOne(html, 'aaaa') === forOne(reversed, 'aaaa');
 })(), true);
 
@@ -410,7 +410,13 @@ check('the path is a full-width row under the figures',
       .length - 3}"`).test(html), true);
 
 check('the path row carries the working directory and branch',
-  /<tr class="path">\s*<td[^>]*>\/Users\/me\/buildgit\/alpha · main</.test(html),
+  /<tr class="path">\s*<td[^>]*>(?:<span class="folder[^"]*"[^>]*>.*?<\/span>)?\/Users\/me\/buildgit\/alpha · main</.test(html),
+  true);
+
+// The project's colour sits on the folder in front of the path it names, not
+// beside the title where it would read as one more measure of the session.
+check('the project colour is a folder in front of the path',
+  /<tr class="path">\s*<td[^>]*><span class="folder s\d"><svg [^>]*><path [^>]*\/><\/svg><\/span>\/Users\/me\/buildgit\/alpha/.test(html),
   true);
 
 // The bar is on the second line spanning Size and Cost, where it has the width
